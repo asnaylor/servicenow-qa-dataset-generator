@@ -35,6 +35,16 @@ python3.11 scripts/ray_servicenow_ticket_pipeline.py \
   --overwrite
 ```
 
+## Browse Results
+
+For quick one-line summaries and drill-down viewing of kept/rejected outputs:
+
+```bash
+python scripts/ticket_browser.py \
+  --kept ${SCRATCH}/tickets_kept \
+  --rejected ${SCRATCH}/tickets_rejected
+```
+
 ## podman-hpc
 
 If you run on a system where Ray/Python are provided via `podman-hpc`, mount:
