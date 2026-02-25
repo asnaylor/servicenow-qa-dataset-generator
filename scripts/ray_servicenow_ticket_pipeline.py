@@ -19,6 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+
 
 LOG = logging.getLogger("servicenow_ticket_pipeline")
 
@@ -109,13 +117,23 @@ def _norm_lower(value: Any) -> str:
 @dataclass(frozen=True)
 class RejectionConfig:
     require_closed_state: bool = True
-    allowed_states: tuple[str, ...] = ("Closed",)
+    allowed_states: tuple[str, ...] = ("Closed", "Resolved")
     require_inactive: bool = True
     allow_active_unknown: bool = False
     reject_auto_generated: bool = True
+    require_close_code: bool = False
+    allowed_close_codes: tuple[str, ...] = ()
+    reject_close_codes: tuple[str, ...] = ()
 
     # Heuristics for "auto generated". Keep these conservative and configurable.
-    reject_sys_created_by: tuple[str, ...] = ("system",)
+    reject_sys_created_by: tuple[str, ...] = (
+        "system",
+        "autoticketing",
+        "auto-ops",
+        "auto-consult",
+        "auto-consultant",
+        "home_perm_tickets",
+    )
     reject_contact_type_substrings: tuple[str, ...] = (
         "event",
         "monitor",
@@ -123,12 +141,28 @@ class RejectionConfig:
         "integration",
         "auto",
     )
-    allowed_alerting_rules: tuple[str, ...] = ("", "manual")
+    allowed_alerting_rules: tuple[str, ...] = ("", "manual", "default")
     reject_if_record_producer_present: bool = True
     reject_if_short_description_matches: tuple[str, ...] = (
         r"\bauto(?:-| )?generated\b",
         r"\bautomated\b",
     )
+
+    # Content quality filters for Q&A datasets
+    require_close_notes: bool = False
+    min_short_description_length: int = 0
+    min_close_notes_length: int = 0
+    min_total_comments: int = 0
+
+    # Contact type filtering
+    allowed_contact_types: tuple[str, ...] = ()
+    reject_contact_types: tuple[str, ...] = ()
+
+    # Category/resource filtering
+    allowed_categories: tuple[str, ...] = ()
+    reject_categories: tuple[str, ...] = ()
+    allowed_resources: tuple[str, ...] = ()
+    reject_resources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -214,18 +248,37 @@ def _evaluate_rejections(
 
     state = _norm(incident_fields.get("state"))
     state_lower = state.lower()
+    allowed_states_lower = {s.lower() for s in rejection_config.allowed_states}
+    is_allowed_state = bool(state_lower) and state_lower in allowed_states_lower
+    close_code = _norm(incident_fields.get("close_code"))
+    close_code_lower = close_code.lower()
 
     if rejection_config.require_closed_state:
-        allowed = {s.lower() for s in rejection_config.allowed_states}
         if not state:
             reasons.append("missing_state")
-        elif state_lower not in allowed:
+        elif not is_allowed_state:
             reasons.append(f"state_not_allowed:{state}")
+
+    if rejection_config.require_close_code and not close_code:
+        reasons.append("missing_close_code")
+
+    if rejection_config.allowed_close_codes:
+        allowed_close_codes_lower = {c.lower() for c in rejection_config.allowed_close_codes}
+        if close_code_lower and close_code_lower not in allowed_close_codes_lower:
+            reasons.append(f"close_code_not_allowed:{close_code}")
+
+    if rejection_config.reject_close_codes:
+        reject_close_codes_lower = {c.lower() for c in rejection_config.reject_close_codes}
+        if close_code_lower and close_code_lower in reject_close_codes_lower:
+            reasons.append(f"close_code_rejected:{close_code}")
 
     if rejection_config.require_inactive:
         active = _parse_bool(incident_fields.get("active"))
         if active is True:
-            reasons.append("active_ticket")
+            # In ServiceNow exports, "Resolved" tickets are often still marked active=true.
+            # If the state is allowed and terminal, prefer the state field over `active`.
+            if not (is_allowed_state and state_lower == "resolved"):
+                reasons.append("active_ticket")
         elif active is None:
             if not rejection_config.allow_active_unknown:
                 reasons.append("active_unknown")
@@ -258,12 +311,70 @@ def _evaluate_rejections(
 
     # If we're requiring "closed", missing timestamps are a useful rejection reason.
     # Keep this distinct from state-based filtering (some workflows use Closed without closed_at).
-    if rejection_config.require_closed_state and state_lower in {
-        s.lower() for s in rejection_config.allowed_states
-    }:
+    if rejection_config.require_closed_state and is_allowed_state:
         closed_at = _norm(incident_fields.get("closed_at"))
-        if not closed_at:
-            reasons.append("missing_closed_at")
+        resolved_at = _norm(incident_fields.get("resolved_at"))
+        if state_lower == "closed":
+            if not closed_at:
+                reasons.append("missing_closed_at")
+        else:
+            if not closed_at and not resolved_at:
+                reasons.append("missing_closed_or_resolved_at")
+
+    # Content quality filters
+    if rejection_config.require_close_notes:
+        close_notes = _norm(incident_fields.get("close_notes"))
+        if not close_notes:
+            reasons.append("missing_close_notes")
+
+    if rejection_config.min_short_description_length > 0:
+        short_desc = _norm(incident_fields.get("short_description"))
+        if len(short_desc) < rejection_config.min_short_description_length:
+            reasons.append(f"short_description_too_short:{len(short_desc)}")
+
+    if rejection_config.min_close_notes_length > 0:
+        close_notes = _norm(incident_fields.get("close_notes"))
+        if len(close_notes) < rejection_config.min_close_notes_length:
+            reasons.append(f"close_notes_too_short:{len(close_notes)}")
+
+    # Contact type filtering
+    contact_type = _norm(incident_fields.get("contact_type"))
+    contact_type_lower = contact_type.lower()
+    if rejection_config.allowed_contact_types:
+        allowed_contact_types_lower = {c.lower() for c in rejection_config.allowed_contact_types}
+        if contact_type_lower and contact_type_lower not in allowed_contact_types_lower:
+            reasons.append(f"contact_type_not_allowed:{contact_type}")
+
+    if rejection_config.reject_contact_types:
+        reject_contact_types_lower = {c.lower() for c in rejection_config.reject_contact_types}
+        if contact_type_lower and contact_type_lower in reject_contact_types_lower:
+            reasons.append(f"contact_type_rejected:{contact_type}")
+
+    # Category filtering
+    category = _norm(incident_fields.get("category"))
+    category_lower = category.lower()
+    if rejection_config.allowed_categories:
+        allowed_categories_lower = {c.lower() for c in rejection_config.allowed_categories}
+        if category_lower and category_lower not in allowed_categories_lower:
+            reasons.append(f"category_not_allowed:{category}")
+
+    if rejection_config.reject_categories:
+        reject_categories_lower = {c.lower() for c in rejection_config.reject_categories}
+        if category_lower and category_lower in reject_categories_lower:
+            reasons.append(f"category_rejected:{category}")
+
+    # Resource filtering
+    resource = _norm(incident_fields.get("u_resource"))
+    resource_lower = resource.lower()
+    if rejection_config.allowed_resources:
+        allowed_resources_lower = {r.lower() for r in rejection_config.allowed_resources}
+        if resource_lower and resource_lower not in allowed_resources_lower:
+            reasons.append(f"resource_not_allowed:{resource}")
+
+    if rejection_config.reject_resources:
+        reject_resources_lower = {r.lower() for r in rejection_config.reject_resources}
+        if resource_lower and resource_lower in reject_resources_lower:
+            reasons.append(f"resource_rejected:{resource}")
 
     return reasons
 
@@ -292,6 +403,12 @@ def _normalize_ticket_record(
     discussion_fields = _extract_discussion_texts(discussions)
     rejection_reasons = _evaluate_rejections(incident_fields, rejection_config)
 
+    # Check min_total_comments (statistics-based filter)
+    if rejection_config.min_total_comments > 0:
+        total_comments = int(statistics.get("total_comments") or 0)
+        if total_comments < rejection_config.min_total_comments:
+            rejection_reasons.append(f"total_comments_too_few:{total_comments}")
+
     total_attachments = int(statistics.get("total_attachments") or 0)
     attachments_count = len(attachments) if isinstance(attachments, list) else 0
     # If attachments were dropped upstream (e.g. during JSONL conversion), preserve
@@ -319,11 +436,13 @@ def _normalize_ticket_record(
         "active": _parse_bool(incident_fields.get("active")),
         "opened_at": _norm(incident_fields.get("opened_at") or incident_fields.get("sys_created_on")),
         "closed_at": _norm(incident_fields.get("closed_at")),
+        "resolved_at": _norm(incident_fields.get("resolved_at")),
         "priority": _norm(incident_fields.get("priority")),
         "impact": _norm(incident_fields.get("impact")),
         "urgency": _norm(incident_fields.get("urgency")),
         "category": _norm(incident_fields.get("category")),
         "subcategory": _norm(incident_fields.get("subcategory")),
+        "u_resource": _norm(incident_fields.get("u_resource")),
         "assignment_group": _norm(incident_fields.get("assignment_group")),
         "assigned_to": _norm(incident_fields.get("assigned_to")),
         "opened_by": _norm(incident_fields.get("opened_by")),
@@ -461,9 +580,63 @@ def _write_dataset(ds: Any, *, output_dir: str, output_format: str) -> None:
     raise ValueError(f"Unsupported output_format: {output_format}")
 
 
+def _load_toml_config(config_path: str) -> dict[str, Any]:
+    """Load configuration from a TOML file."""
+    if tomllib is None:
+        raise SystemExit(
+            "TOML support not available. Install with `pip install tomli` (Python <3.11) "
+            "or use Python 3.11+ which includes tomllib."
+        )
+
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _config_to_rejection_config(config: dict[str, Any]) -> RejectionConfig:
+    """Convert TOML config dict to RejectionConfig."""
+    state_cfg = config.get("state", {})
+    close_codes_cfg = config.get("close_codes", {})
+    contact_types_cfg = config.get("contact_types", {})
+    auto_generated_cfg = config.get("auto_generated", {})
+    content_quality_cfg = config.get("content_quality", {})
+    categories_cfg = config.get("categories", {})
+    resources_cfg = config.get("resources", {})
+
+    return RejectionConfig(
+        require_closed_state=state_cfg.get("require_closed_state", True),
+        allowed_states=tuple(state_cfg.get("allowed_states", ["Closed", "Resolved"])),
+        require_inactive=state_cfg.get("require_inactive", True),
+        allow_active_unknown=state_cfg.get("allow_active_unknown", False),
+        reject_auto_generated=auto_generated_cfg.get("enabled", True),
+        require_close_code=bool(close_codes_cfg.get("allowed") or close_codes_cfg.get("rejected")),
+        allowed_close_codes=tuple(close_codes_cfg.get("allowed", [])),
+        reject_close_codes=tuple(close_codes_cfg.get("rejected", [])),
+        reject_sys_created_by=tuple(auto_generated_cfg.get("reject_sys_created_by", [])),
+        reject_contact_type_substrings=tuple(auto_generated_cfg.get("reject_contact_type_substrings", [])),
+        allowed_alerting_rules=tuple(auto_generated_cfg.get("allowed_alerting_rules", ["", "manual", "default"])),
+        reject_if_record_producer_present=auto_generated_cfg.get("reject_if_record_producer_present", True),
+        reject_if_short_description_matches=tuple(auto_generated_cfg.get("reject_if_short_description_matches", [])),
+        require_close_notes=content_quality_cfg.get("require_close_notes", False),
+        min_short_description_length=content_quality_cfg.get("min_short_description_length", 0),
+        min_close_notes_length=content_quality_cfg.get("min_close_notes_length", 0),
+        min_total_comments=content_quality_cfg.get("min_total_comments", 0),
+        allowed_contact_types=tuple(contact_types_cfg.get("allowed", [])),
+        reject_contact_types=tuple(contact_types_cfg.get("rejected", [])),
+        allowed_categories=tuple(categories_cfg.get("allowed", [])),
+        reject_categories=tuple(categories_cfg.get("rejected", [])),
+        allowed_resources=tuple(resources_cfg.get("allowed", [])),
+        reject_resources=tuple(resources_cfg.get("rejected", [])),
+    )
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Filter and normalize ServiceNow ticket JSON files with Ray Data.",
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to TOML config file for filtering rules.",
     )
     parser.add_argument(
         "--input",
@@ -524,24 +697,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
 
-    # Rejection rules.
-    parser.add_argument(
-        "--allowed-state",
-        action="append",
-        default=[],
-        help='Allowed state(s) for kept tickets. Repeatable. Default: "Closed".',
-    )
-    parser.add_argument(
-        "--allow-active-unknown",
-        action="store_true",
-        help="Do not reject tickets when the 'active' field is missing/unparseable.",
-    )
-    parser.add_argument(
-        "--keep-auto-generated",
-        action="store_true",
-        help="Do not apply auto-generated rejection heuristics.",
-    )
-
     return parser.parse_args(argv)
 
 
@@ -581,14 +736,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if output_config.rejected_dir:
         _ensure_output_dir(output_config.rejected_dir, output_config.overwrite)
 
-    allowed_states = tuple(args.allowed_state) if args.allowed_state else ("Closed",)
-    rejection_config = RejectionConfig(
-        allowed_states=allowed_states,
-        reject_auto_generated=not args.keep_auto_generated,
-    )
-
-    if args.allow_active_unknown:
-        rejection_config = dataclasses.replace(rejection_config, allow_active_unknown=True)
+    # Load config from TOML
+    LOG.info("Loading configuration from: %s", args.config)
+    toml_config = _load_toml_config(args.config)
+    rejection_config = _config_to_rejection_config(toml_config)
 
     # Keep driver logs for debugging unless explicitly disabled
     ray.init(address=args.ray_address, ignore_reinit_error=True, log_to_driver=True)

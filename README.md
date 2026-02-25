@@ -17,19 +17,20 @@ The Ray pipeline reads **JSONL shards** (one ticket per line, `*.jsonl` or `*.js
 If your tickets are exported as **one JSON object per file** (often with large `attachments`), convert them to sharded JSONL first. The converter drops the top-level `attachments` field by default.
 
 ```bash
-python3.11 scripts/convert_servicenow_tickets_to_jsonl.py \
+python3 scripts/convert_servicenow_tickets_to_jsonl.py \
   --input-dir /path/to/servicenow_incidents \
   --output-dir ${SCRATCH}/servicenow_incidents_jsonl \
-  --records-per-shard 10000 \
+  --records-per-shard 10000
   --overwrite
 ```
 
 ## Run Pipeline
 
 ```bash
-python3.11 scripts/ray_servicenow_ticket_pipeline.py \
+python3 scripts/ray_servicenow_ticket_pipeline.py \
+  --config config/qa_dataset.toml \
   --input ${SCRATCH}/servicenow_incidents_jsonl \
-  --output-dir ${SCRATCH}/tickets_kept \
+  --output-dir ${SCRATCH}/tickets_qa_dataset \
   --rejected-dir ${SCRATCH}/tickets_rejected \
   --output-format jsonl \
   --overwrite
@@ -40,7 +41,7 @@ python3.11 scripts/ray_servicenow_ticket_pipeline.py \
 For quick one-line summaries and drill-down viewing of kept/rejected outputs:
 
 ```bash
-python scripts/ticket_browser.py \
+python3 scripts/ticket_browser.py \
   --kept ${SCRATCH}/tickets_kept \
   --rejected ${SCRATCH}/tickets_rejected
 ```
@@ -65,6 +66,7 @@ podman-hpc run --rm -u 0 --gpu --nccl --net host --shm-size=40GB --group-add kee
   -e "HF_TOKEN=$(cat ~/.hf_token 2>/dev/null || true)" \
   -w /workdir "rayproject/ray-llm:2.53.0-extra-py311-cu128" \
   python3.11 scripts/ray_servicenow_ticket_pipeline.py \
+    --config config/qa_dataset.toml \
     --input /tickets \
     --output-dir /kept \
     --rejected-dir /rejected \
@@ -77,15 +79,7 @@ podman-hpc run --rm -u 0 --gpu --nccl --net host --shm-size=40GB --group-add kee
 
 This repo includes a SLURM script that starts a Ray cluster across `N` nodes (head + workers) using `podman-hpc`, then runs the ticket pipeline on the Ray head.
 
-1) Convert tickets to JSONL (once), writing to a shared filesystem path visible from all nodes (e.g. `${SCRATCH}`):
-
-```bash
-python3.11 scripts/convert_servicenow_tickets_to_jsonl.py \
-  --input-dir /path/to/servicenow_incidents \
-  --output-dir ${SCRATCH}/servicenow_incidents_jsonl \
-  --records-per-shard 10000 \
-  --overwrite
-```
+1) Convert tickets to JSONL (once), writing to a shared filesystem path visible from all nodes (e.g. `${SCRATCH}`). See [above for code](#input-format).
 
 2) Edit the path variables at the top of `scripts/deploy_ray_cluster.sh` (or export them before `sbatch`) to point to your JSONL + output dirs:
 
@@ -100,8 +94,24 @@ sbatch -N 4 scripts/deploy_ray_cluster.sh
 
 Check logs in `ray-cluster-<jobid>.log` for the Ray dashboard URL and pipeline progress.
 
+## Filtering logic
+
+The pipeline filters tickets and produces kept/rejected datasets with `rejection_reasons`.
+
+**Key decisions for Q&A datasets** (see `config/qa_dataset.toml`):
+- **Close codes**: Keep "Solved" tickets, reject "Not Solved" and duplicates
+- **Contact type**: Keep user-initiated (web/email), reject system-generated
+- **Content**: Require meaningful descriptions and resolutions (min lengths)
+- **Auto-generated**: Reject tickets from automation systems
+
+Edit `config/qa_dataset.toml` to adjust filtering rules for your needs.
+
+**Inspect rejections**:
+```bash
+jq -r '.rejection_reasons[]?' ${SCRATCH}/tickets_rejected/*.json | sort | uniq -c | sort -nr | head -20
+```
+
 ## Notes
 
-- Default kept tickets require `incident_fields.state == "Closed"` and an explicit `closed_at`.
-- Auto-generated rejection is heuristic; use `--keep-auto-generated` to disable it.
-- Use `--read-num-blocks N` to control JSONL read parallelism (Ray 2.53.0 uses `override_num_blocks`).
+- All filtering rules are defined in `config/qa_dataset.toml`
+- Use `--read-num-blocks N` to control JSONL read parallelism if needed

@@ -1,0 +1,74 @@
+# Configuration for filtering ServiceNow tickets into a Q&A dataset
+# Use with: --config config/qa_dataset.toml
+
+[state]
+# Only keep closed/resolved tickets
+allowed_states = ["Closed", "Resolved"]
+require_inactive = true
+allow_active_unknown = false
+
+[close_codes]
+# Keep tickets with successful resolutions
+allowed = [
+    "Solved (Permanently)",
+    "Solved (Work Around)",
+    "Resolved by Requester",
+]
+
+# Reject tickets without real solutions
+rejected = [
+    "Not Solved (No User Response)",
+    "Duplicate",
+    "No Fault Found",
+    "Not Solved (Not Reproducible)",
+    "Not Solved (Too Costly)",
+]
+
+[contact_types]
+# Keep only user-initiated tickets (real questions)
+allowed = [
+    "user web interface",
+    "email",
+]
+
+[auto_generated]
+# Reject automated/system-generated tickets
+enabled = true
+reject_sys_created_by = [
+    "system",
+    "autoticketing",
+    "auto-ops",
+    "auto-consult",
+    "auto-consultant",
+    "home_perm_tickets",
+]
+reject_contact_type_substrings = [
+    "event",
+    "monitor",
+    "alert",
+    "integration",
+    "auto",
+]
+allowed_alerting_rules = ["", "manual", "default"]
+reject_if_record_producer_present = true
+reject_if_short_description_matches = [
+    "\\bauto(?:-| )?generated\\b",
+    "\\bautomated\\b",
+]
+
+[content_quality]
+# Ensure tickets have meaningful content
+require_close_notes = true
+min_short_description_length = 20
+min_close_notes_length = 50
+min_total_comments = 0
+
+[categories]
+# Optional: filter by category (empty = allow all)
+allowed = []
+rejected = []
+
+[resources]
+# Optional: filter by resource/system (empty = allow all)
+allowed = []
+rejected = ["ServiceNow"]  # Reject meta-tickets about ticketing system

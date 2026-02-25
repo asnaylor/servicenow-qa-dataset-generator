@@ -39,8 +39,8 @@ export HF_KEY="${HF_TOKEN:-}"
 TICKETS_JSONL_DIR="${TICKETS_JSONL_DIR:-${SCRATCH}/servicenow_incidents_jsonl}"
 
 # Output directories (host paths). Default to job-scoped scratch folders.
-KEPT_DIR="${KEPT_DIR:-${SCRATCH}/tickets_kept}"
-REJECTED_DIR="${REJECTED_DIR:-${SCRATCH}/tickets_rejected}"
+KEPT_DIR="${KEPT_DIR:-${SCRATCH}/servicenow_incidents_processed/kept}"
+REJECTED_DIR="${REJECTED_DIR:-${SCRATCH}/servicenow_incidents_processed/rejected}"
 
 # Container mount points for the pipeline.
 MOUNT_TICKETS="/tickets"
@@ -221,13 +221,14 @@ log "REJECTED_DIR=${REJECTED_DIR} (mounted at ${MOUNT_REJECTED})"
 
 # Edit PIPELINE_ARGS to add/remove flags as needed.
 PIPELINE_ARGS=(
+  --config config/qa_dataset.toml
   --input "${MOUNT_TICKETS}"
   --output-dir "${MOUNT_KEPT}"
   --rejected-dir "${MOUNT_REJECTED}"
   --output-format jsonl
   --overwrite
   --ray-address "${RAY_ADDRESS}"
-  --limit-files 2000
+  --limit-files 1000
   --log-level INFO
 )
 
@@ -235,4 +236,4 @@ PIPELINE_ARGS=(
 # Optional: debug mode
 # PIPELINE_ARGS+=(--limit-files 1000)
 
-PODMAN_WITH_RAY_TMPDIR=1 podman_llm python3.11 scripts/ray_servicenow_ticket_pipeline.py "${PIPELINE_ARGS[@]}"
+PODMAN_WITH_RAY_TMPDIR=1 podman_llm python3 scripts/ray_servicenow_ticket_pipeline.py "${PIPELINE_ARGS[@]}"
