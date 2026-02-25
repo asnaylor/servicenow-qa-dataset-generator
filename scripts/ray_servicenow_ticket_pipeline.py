@@ -2,9 +2,9 @@
 """
 Ray Data pipeline for filtering and normalizing ServiceNow ticket JSON files.
 
-This repo's JSON files (e.g. 81.json) are single JSON objects per file (pretty-printed),
-not JSONL. Ray's `read_json` is often optimized for JSONL, so this pipeline reads files
-as raw bytes and parses JSON in a map stage.
+This pipeline expects JSONL shards (one ticket per line). Use
+`scripts/convert_servicenow_tickets_to_jsonl.py` to convert from "one JSON object per
+file" exports into JSONL.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import glob
-import json
 import logging
 import re
 import shutil
@@ -35,8 +34,18 @@ def _has_glob_magic(path: str) -> bool:
     return any(ch in path for ch in ("*", "?", "["))
 
 
-def _discover_local_json_files(inputs: Sequence[str], recursive: bool) -> list[str]:
+def _discover_local_files(
+    inputs: Sequence[str],
+    *,
+    recursive: bool,
+    allowed_suffixes: tuple[str, ...],
+) -> list[str]:
     files: list[str] = []
+
+    def is_allowed(path: Path) -> bool:
+        s = str(path)
+        return any(s.endswith(suffix) for suffix in allowed_suffixes)
+
     for raw in inputs:
         if "://" in raw:
             raise ValueError(
@@ -45,19 +54,24 @@ def _discover_local_json_files(inputs: Sequence[str], recursive: bool) -> list[s
 
         p = Path(raw)
         if p.is_dir():
-            pattern = "**/*.json" if recursive else "*.json"
-            files.extend(str(x) for x in p.glob(pattern) if x.is_file())
+            for suffix in allowed_suffixes:
+                pattern = f"**/*{suffix}" if recursive else f"*{suffix}"
+                files.extend(str(x) for x in p.glob(pattern) if x.is_file())
             continue
 
         if _has_glob_magic(raw):
             files.extend(
                 str(Path(x))
                 for x in glob.glob(raw, recursive=recursive)
-                if Path(x).is_file()
+                if Path(x).is_file() and is_allowed(Path(x))
             )
             continue
 
         if p.is_file():
+            if not is_allowed(p):
+                raise ValueError(
+                    f"Input file does not match expected suffixes {allowed_suffixes}: {raw}"
+                )
             files.append(str(p))
             continue
 
@@ -132,8 +146,21 @@ def _ensure_output_dir(path: str, overwrite: bool) -> None:
             raise FileExistsError(
                 f"Output directory already exists: {path}. Use --overwrite to replace it."
             )
-        shutil.rmtree(p)
-    p.mkdir(parents=True, exist_ok=True)
+        # If `path` is a bind mount (common in containers), attempting to remove the
+        # mountpoint itself can fail with "Device or resource busy". Instead, clear
+        # contents in-place and keep the directory.
+        if p.is_dir():
+            for child in p.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        else:
+            p.unlink()
+            p.mkdir(parents=True, exist_ok=True)
+            return
+    else:
+        p.mkdir(parents=True, exist_ok=True)
 
 
 def _extract_discussion_texts(
@@ -265,6 +292,13 @@ def _normalize_ticket_record(
     discussion_fields = _extract_discussion_texts(discussions)
     rejection_reasons = _evaluate_rejections(incident_fields, rejection_config)
 
+    total_attachments = int(statistics.get("total_attachments") or 0)
+    attachments_count = len(attachments) if isinstance(attachments, list) else 0
+    # If attachments were dropped upstream (e.g. during JSONL conversion), preserve
+    # a reasonable count from the statistics block.
+    if attachments_count == 0 and total_attachments:
+        attachments_count = total_attachments
+
     # Core identifiers.
     incident_number = _norm(metadata.get("incident_number")) or _norm(
         incident_fields.get("number")
@@ -305,67 +339,12 @@ def _normalize_ticket_record(
         "record_producer": _norm(incident_fields.get("u_record_producer")),
         "total_comments": int(statistics.get("total_comments") or 0),
         "total_work_notes": int(statistics.get("total_work_notes") or 0),
-        "total_attachments": int(statistics.get("total_attachments") or 0),
-        "attachments_count": len(attachments) if isinstance(attachments, list) else 0,
+        "total_attachments": total_attachments,
+        "attachments_count": attachments_count,
         **discussion_fields,
     }
 
     return record
-
-
-def _parse_and_normalize_row(
-    row: Mapping[str, Any],
-    *,
-    rejection_config: RejectionConfig,
-) -> dict[str, Any]:
-    # Ray's `read_binary_files(..., include_paths=True)` has historically produced
-    # columns named ("bytes", "path"), but different versions may vary. Handle both.
-    source_path = _norm(row.get("path") or row.get("file_path") or row.get("uri"))
-    blob = row.get("bytes") or row.get("data") or row.get("content")
-
-    if blob is None:
-        return {
-            "kept": False,
-            "rejection_reasons": ["missing_file_bytes"],
-            "source_path": source_path,
-        }
-
-    if isinstance(blob, memoryview):
-        blob = blob.tobytes()
-
-    if isinstance(blob, str):
-        text = blob
-    else:
-        try:
-            text = blob.decode("utf-8")
-        except Exception:
-            return {
-                "kept": False,
-                "rejection_reasons": ["utf8_decode_error"],
-                "source_path": source_path,
-            }
-
-    try:
-        ticket = json.loads(text)
-    except Exception:
-        return {
-            "kept": False,
-            "rejection_reasons": ["json_parse_error"],
-            "source_path": source_path,
-        }
-
-    if not isinstance(ticket, dict):
-        return {
-            "kept": False,
-            "rejection_reasons": ["json_not_object"],
-            "source_path": source_path,
-        }
-
-    return _normalize_ticket_record(
-        ticket,
-        source_path=source_path,
-        rejection_config=rejection_config,
-    )
 
 
 def _iter_batch_rows(batch: Any) -> Iterable[Mapping[str, Any]]:
@@ -450,19 +429,25 @@ def _columnarize_records(records: list[Mapping[str, Any]]) -> dict[str, list[Any
     return out
 
 
-def _parse_and_normalize_batch(
+def _normalize_ticket_batch(
     batch: Any,
     *,
     rejection_config: RejectionConfig,
 ) -> dict[str, list[Any]]:
     """
-    Process a batch of rows for better performance with Ray Data.
-
-    This uses map_batches which is more efficient than row-by-row map operations.
+    Normalize a batch of already-parsed ticket dicts (e.g. from `read_json` on JSONL).
     """
     results: list[dict[str, Any]] = []
     for row in _iter_batch_rows(batch):
-        results.append(_parse_and_normalize_row(row, rejection_config=rejection_config))
+        source_path = _norm(row.get("source_path") or row.get("path") or "")
+        # `row` is the ticket dict when reading JSONL (plus optional provenance fields).
+        results.append(
+            _normalize_ticket_record(
+                row,
+                source_path=source_path,
+                rejection_config=rejection_config,
+            )
+        )
     return _columnarize_records(results)
 
 
@@ -484,7 +469,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--input",
         nargs="+",
         required=True,
-        help="Input file/dir/glob(s). For dirs, scans for *.json.",
+        help='Input JSONL file/dir/glob(s). For dirs, scans for "*.jsonl" and "*.jsonl.gz".',
     )
     parser.add_argument(
         "--output-dir",
@@ -529,10 +514,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
     )
     parser.add_argument(
-        "--concurrency",
+        "--read-num-blocks",
         type=int,
         default=None,
-        help="Number of concurrent read tasks for Ray Data. Defaults to Ray auto-detection.",
+        help=(
+            "Controls JSONL read parallelism by setting `override_num_blocks` on "
+            "ray.data.read_json (Ray 2.53.0). If omitted, the script picks an "
+            "automatic value based on cluster CPUs and total input size."
+        ),
     )
 
     # Rejection rules.
@@ -569,7 +558,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     recursive = not args.no_recursive
-    input_files = _discover_local_json_files(args.input, recursive=recursive)
+
+    input_files = _discover_local_files(
+        args.input,
+        recursive=recursive,
+        allowed_suffixes=(".jsonl", ".jsonl.gz"),
+    )
+
     if args.limit_files is not None:
         input_files = input_files[: args.limit_files]
     if not input_files:
@@ -598,17 +593,56 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Keep driver logs for debugging unless explicitly disabled
     ray.init(address=args.ray_address, ignore_reinit_error=True, log_to_driver=True)
 
-    # Read and parse each JSON object per file with optional concurrency control
-    read_kwargs = {"include_paths": True}
-    if args.concurrency is not None:
-        read_kwargs["concurrency"] = args.concurrency
+    # JSONL shards: one JSON object per line.
+    # Automatic default: aim to create enough tasks to utilize the cluster while
+    # avoiding extremely tiny blocks.
+    total_bytes = 0
+    for raw in input_files:
+        try:
+            total_bytes += Path(raw).stat().st_size
+        except Exception:
+            # Best-effort only; fall back to CPU-based heuristics.
+            total_bytes = 0
+            break
 
-    ds = ray.data.read_binary_files(input_files, **read_kwargs)
+    cluster_cpus = int(ray.cluster_resources().get("CPU", 1))
+    requested_num_blocks = args.read_num_blocks
 
-    # Use map_batches for better performance (2-5x faster than row-by-row map)
-    LOG.info("Processing %d file(s) with Ray Data...", len(input_files))
+    min_block_bytes = 4 * 1024 * 1024  # 4 MiB: avoid creating extremely tiny blocks
+    max_blocks_by_size = (
+        max(1, (total_bytes + min_block_bytes - 1) // min_block_bytes)
+        if total_bytes
+        else None
+    )
+    auto_num_blocks = max(cluster_cpus, len(input_files) * 4)
+    if max_blocks_by_size is not None:
+        auto_num_blocks = min(auto_num_blocks, int(max_blocks_by_size))
+
+    chosen_num_blocks = (
+        int(requested_num_blocks) if requested_num_blocks is not None else int(auto_num_blocks)
+    )
+
+    # Ray 2.53.0: `ray.data.read_json` supports `override_num_blocks`.
+    read_kwargs: dict[str, Any] = {"override_num_blocks": chosen_num_blocks}
+    if requested_num_blocks is None:
+        LOG.info(
+            "Auto-selecting JSONL read parallelism: override_num_blocks=%d (cluster CPUs=%d, shards=%d, size≈%.2f GiB).",
+            chosen_num_blocks,
+            cluster_cpus,
+            len(input_files),
+            (total_bytes / (1024**3)) if total_bytes else 0.0,
+        )
+    else:
+        LOG.info(
+            "Using requested JSONL read parallelism: override_num_blocks=%d.",
+            chosen_num_blocks,
+        )
+
+    ds = ray.data.read_json(input_files, **read_kwargs)
+
+    LOG.info("Processing %d JSONL shard(s) with Ray Data...", len(input_files))
     normalized = ds.map_batches(
-        lambda batch: _parse_and_normalize_batch(batch, rejection_config=rejection_config),
+        lambda batch: _normalize_ticket_batch(batch, rejection_config=rejection_config),
         batch_format="pyarrow",
     )
 
