@@ -153,6 +153,8 @@ class RejectionConfig:
     min_short_description_length: int = 0
     min_close_notes_length: int = 0
     min_total_comments: int = 0
+    reject_generic_close_notes: bool = False
+    reject_generic_close_notes_patterns: tuple[str, ...] = ()
 
     # Contact type filtering
     allowed_contact_types: tuple[str, ...] = ()
@@ -336,6 +338,13 @@ def _evaluate_rejections(
         close_notes = _norm(incident_fields.get("close_notes"))
         if len(close_notes) < rejection_config.min_close_notes_length:
             reasons.append(f"close_notes_too_short:{len(close_notes)}")
+
+    if rejection_config.reject_generic_close_notes:
+        close_notes = _norm(incident_fields.get("close_notes"))
+        for pattern in rejection_config.reject_generic_close_notes_patterns:
+            if close_notes and re.search(pattern, close_notes, flags=re.IGNORECASE):
+                reasons.append("close_notes_generic")
+                break
 
     # Contact type filtering
     contact_type = _norm(incident_fields.get("contact_type"))
@@ -620,6 +629,10 @@ def _config_to_rejection_config(config: dict[str, Any]) -> RejectionConfig:
         min_short_description_length=content_quality_cfg.get("min_short_description_length", 0),
         min_close_notes_length=content_quality_cfg.get("min_close_notes_length", 0),
         min_total_comments=content_quality_cfg.get("min_total_comments", 0),
+        reject_generic_close_notes=content_quality_cfg.get("reject_generic_close_notes", False),
+        reject_generic_close_notes_patterns=tuple(
+            content_quality_cfg.get("reject_generic_close_notes_patterns", [])
+        ),
         allowed_contact_types=tuple(contact_types_cfg.get("allowed", [])),
         reject_contact_types=tuple(contact_types_cfg.get("rejected", [])),
         allowed_categories=tuple(categories_cfg.get("allowed", [])),

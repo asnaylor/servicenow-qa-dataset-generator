@@ -228,7 +228,6 @@ PIPELINE_ARGS=(
   --output-format jsonl
   --overwrite
   --ray-address "${RAY_ADDRESS}"
-  --limit-files 1000
   --log-level INFO
 )
 

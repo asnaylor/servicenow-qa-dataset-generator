@@ -1,74 +1,73 @@
 # Configuration for filtering ServiceNow tickets into a Q&A dataset
-# Use with: --config config/qa_dataset.toml
+# Matches SQL query for consistent filtering across systems
 
 [state]
-# Only keep closed/resolved tickets
+# state IN ('Closed', 'Resolved')
 allowed_states = ["Closed", "Resolved"]
-require_inactive = true
-allow_active_unknown = false
+require_inactive = false
+allow_active_unknown = true
 
 [close_codes]
-# Keep tickets with successful resolutions
+# close_code IN ('Solved (Permanently)', 'Solved (Work Around)', 'Resolved by Requester')
 allowed = [
     "Solved (Permanently)",
     "Solved (Work Around)",
     "Resolved by Requester",
 ]
-
-# Reject tickets without real solutions
-rejected = [
-    "Not Solved (No User Response)",
-    "Duplicate",
-    "No Fault Found",
-    "Not Solved (Not Reproducible)",
-    "Not Solved (Too Costly)",
-]
+rejected = []
 
 [contact_types]
-# Keep only user-initiated tickets (real questions)
+# contact_type IN ('User Web Interface', 'Email')
 allowed = [
     "user web interface",
     "email",
 ]
+rejected = []
 
 [auto_generated]
-# Reject automated/system-generated tickets
+# Disable auto-generated heuristics to match SQL query exactly
 enabled = true
-reject_sys_created_by = [
-    "system",
-    "autoticketing",
-    "auto-ops",
-    "auto-consult",
-    "auto-consultant",
-    "home_perm_tickets",
-]
-reject_contact_type_substrings = [
-    "event",
-    "monitor",
-    "alert",
-    "integration",
-    "auto",
-]
-allowed_alerting_rules = ["", "manual", "default"]
-reject_if_record_producer_present = true
-reject_if_short_description_matches = [
-    "\\bauto(?:-| )?generated\\b",
-    "\\bautomated\\b",
-]
+  reject_if_record_producer_present = false
+  reject_if_short_description_matches = [
+    "cori",
+    "\\b(?:quota\\b.*\\bincrease|increase\\b.*\\bquota)\\b",
+    "newt",
+    "\\b(?:ip|reservation|access|database|cname)\\s+request\\b"
+  ]
 
 [content_quality]
-# Ensure tickets have meaningful content
-require_close_notes = true
-min_short_description_length = 20
-min_close_notes_length = 50
+# No length requirements to match SQL query
+require_close_notes = false
+min_short_description_length = 0
+min_close_notes_length = 0
 min_total_comments = 0
 
 [categories]
-# Optional: filter by category (empty = allow all)
+# category NOT IN ('Account Support', 'Allocations', 'ERCAP', 'account support')
 allowed = []
-rejected = []
+rejected = [
+    "Account Support",
+    "Allocations",
+    "ERCAP",
+    "account support",
+    "Workstation Support",
+    "Hardware"
+]
 
 [resources]
-# Optional: filter by resource/system (empty = allow all)
+# u_resource NOT IN ('Cori', 'Gerty', 'Cori cscratch', 'Cori GPU', 'NoMachine', 'Cori Large Memory', 'Hopper', 'Edison', 'Genepool', 'NEWT')
 allowed = []
-rejected = ["ServiceNow"]  # Reject meta-tickets about ticketing system
+rejected = [
+    "Cori",
+    "Gerty",
+    "Cori cscratch",
+    "Cori GPU",
+    "NoMachine",
+    "Cori Large Memory",
+    "Hopper",
+    "Edison",
+    "Genepool",
+    "NEWT",
+    "JGI Web Server",
+    "Cori Ex Vivo"
+]
