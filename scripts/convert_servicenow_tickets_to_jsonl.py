@@ -16,17 +16,150 @@ This converter:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import gzip
 import json
 import logging
+import re
 import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping, Pattern
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
 
 
 LOG = logging.getLogger("convert_servicenow_tickets_to_jsonl")
+
+
+def _norm(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+@dataclasses.dataclass(frozen=True)
+class RejectionConfig:
+    allowed_states: frozenset[str]
+    allowed_close_codes: frozenset[str]
+    rejected_close_codes: frozenset[str]
+    allowed_contact_types: frozenset[str]
+    rejected_contact_types: frozenset[str]
+    short_description_patterns: tuple[Pattern[str], ...]
+    allowed_categories: frozenset[str]
+    rejected_categories: frozenset[str]
+    allowed_resources: frozenset[str]
+    rejected_resources: frozenset[str]
+
+
+def _load_toml_config(config_path: str) -> dict[str, Any]:
+    if tomllib is None:
+        raise SystemExit(
+            "TOML support not available. Install `tomli` for Python <3.11, or use Python 3.11+."
+        )
+    with open(config_path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _config_to_rejection_config(config: dict[str, Any]) -> RejectionConfig:
+    def _lower_set(values: Any) -> frozenset[str]:
+        if not isinstance(values, list):
+            return frozenset()
+        return frozenset(_norm(v).lower() for v in values if _norm(v))
+
+    def _compiled_patterns(values: Any) -> tuple[Pattern[str], ...]:
+        if not isinstance(values, list):
+            return ()
+        patterns: list[Pattern[str]] = []
+        for value in values:
+            pat = _norm(value)
+            if not pat:
+                continue
+            patterns.append(re.compile(pat, flags=re.IGNORECASE))
+        return tuple(patterns)
+
+    state_cfg = config.get("state", {})
+    close_codes_cfg = config.get("close_codes", {})
+    contact_types_cfg = config.get("contact_types", {})
+    auto_generated_cfg = config.get("auto_generated", {})
+    categories_cfg = config.get("categories", {})
+    resources_cfg = config.get("resources", {})
+
+    return RejectionConfig(
+        allowed_states=_lower_set(state_cfg.get("allowed_states", ["Closed", "Resolved"])),
+        allowed_close_codes=_lower_set(close_codes_cfg.get("allowed", [])),
+        rejected_close_codes=_lower_set(close_codes_cfg.get("rejected", [])),
+        allowed_contact_types=_lower_set(contact_types_cfg.get("allowed", [])),
+        rejected_contact_types=_lower_set(contact_types_cfg.get("rejected", [])),
+        short_description_patterns=_compiled_patterns(
+            auto_generated_cfg.get("reject_if_short_description_matches", [])
+        ),
+        allowed_categories=_lower_set(categories_cfg.get("allowed", [])),
+        rejected_categories=_lower_set(categories_cfg.get("rejected", [])),
+        allowed_resources=_lower_set(resources_cfg.get("allowed", [])),
+        rejected_resources=_lower_set(resources_cfg.get("rejected", [])),
+    )
+
+
+def _should_reject(
+    incident_fields: Mapping[str, Any],
+    rejection_config: RejectionConfig,
+) -> bool:
+    state = _norm(incident_fields.get("state"))
+    state_lower = state.lower()
+    if not state_lower or state_lower not in rejection_config.allowed_states:
+        return True
+
+    close_code = _norm(incident_fields.get("close_code"))
+    close_code_lower = close_code.lower()
+    if rejection_config.allowed_close_codes and (
+        not close_code_lower or close_code_lower not in rejection_config.allowed_close_codes
+    ):
+        return True
+    if close_code_lower and close_code_lower in rejection_config.rejected_close_codes:
+        return True
+
+    contact_type = _norm(incident_fields.get("contact_type"))
+    contact_type_lower = contact_type.lower()
+    if rejection_config.allowed_contact_types and (
+        not contact_type_lower or contact_type_lower not in rejection_config.allowed_contact_types
+    ):
+        return True
+    if contact_type_lower and contact_type_lower in rejection_config.rejected_contact_types:
+        return True
+
+    short_desc = _norm(incident_fields.get("short_description"))
+    for pattern in rejection_config.short_description_patterns:
+        if short_desc and pattern.search(short_desc):
+            return True
+
+    category = _norm(incident_fields.get("category"))
+    category_lower = category.lower()
+    if rejection_config.allowed_categories and (
+        not category_lower or category_lower not in rejection_config.allowed_categories
+    ):
+        return True
+    if category_lower and category_lower in rejection_config.rejected_categories:
+        return True
+
+    resource = _norm(incident_fields.get("u_resource"))
+    resource_lower = resource.lower()
+    if rejection_config.allowed_resources and (
+        not resource_lower or resource_lower not in rejection_config.allowed_resources
+    ):
+        return True
+    if resource_lower and resource_lower in rejection_config.rejected_resources:
+        return True
+
+    return False
 
 
 def _configure_logging(log_level: str) -> None:
@@ -50,6 +183,7 @@ def _open_text_writer(path: Path, *, gzip_output: bool):
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_config = Path(__file__).resolve().parents[1] / "config" / "qa_dataset.toml"
     parser = argparse.ArgumentParser(
         description="Convert ServiceNow per-file JSON tickets into sharded JSONL."
     )
@@ -122,6 +256,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
     )
+    parser.add_argument(
+        "--config",
+        default=str(default_config),
+        help="Path to TOML config file for filtering rules (default: config/qa_dataset.toml).",
+    )
     return parser.parse_args(argv)
 
 
@@ -188,6 +327,7 @@ class _Progress:
         *,
         processed_files: int,
         written_records: int,
+        filtered_records: int,
         parse_errors: int,
         shard_idx: int,
     ) -> None:
@@ -217,6 +357,7 @@ class _Progress:
                 f"\r[{bar}] {pct:5.1f}%  "
                 f"{processed_files}/{self._total_files}  "
                 f"written={written_records}  "
+                f"filtered={filtered_records}  "
                 f"errors={parse_errors}  "
                 f"shards={shard_idx + 1}  "
                 f"{rate:,.0f} files/s  "
@@ -226,11 +367,12 @@ class _Progress:
             sys.stderr.flush()
         else:
             LOG.info(
-                "Progress: %d/%d (%.1f%%) written=%d errors=%d shards=%d rate=%.0f files/s ETA=%s",
+                "Progress: %d/%d (%.1f%%) written=%d filtered=%d errors=%d shards=%d rate=%.0f files/s ETA=%s",
                 processed_files,
                 self._total_files,
                 pct,
                 written_records,
+                filtered_records,
                 parse_errors,
                 shard_idx + 1,
                 rate,
@@ -263,10 +405,14 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"No *.json files found under: {input_dir}")
 
     LOG.info("Discovered %d JSON file(s).", len(files))
+    LOG.info("Loading filtering config from: %s", args.config)
+    filter_config = _load_toml_config(args.config)
+    rejection_config = _config_to_rejection_config(filter_config)
 
     shard_idx = 0
     shard_records = 0
     written = 0
+    filtered = 0
     parse_errors = 0
 
     progress = _Progress(
@@ -275,10 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         interval_s=float(args.progress_interval_seconds),
     )
 
-    shard_path = _next_shard_path(
-        output_dir, prefix=args.output_prefix, shard_idx=shard_idx, gzip_output=bool(args.gzip)
-    )
-    writer = _open_text_writer(shard_path, gzip_output=bool(args.gzip))
+    writer = None
     LOG.info("Writing shards to %s", output_dir)
 
     try:
@@ -293,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
                 progress.update(
                     processed_files=i + 1,
                     written_records=written,
+                    filtered_records=filtered,
                     parse_errors=parse_errors,
                     shard_idx=shard_idx,
                 )
@@ -305,6 +449,21 @@ def main(argv: list[str] | None = None) -> int:
                 progress.update(
                     processed_files=i + 1,
                     written_records=written,
+                    filtered_records=filtered,
+                    parse_errors=parse_errors,
+                    shard_idx=shard_idx,
+                )
+                continue
+
+            incident_fields = ticket.get("incident_fields")
+            if not isinstance(incident_fields, dict):
+                incident_fields = {}
+            if _should_reject(incident_fields, rejection_config):
+                filtered += 1
+                progress.update(
+                    processed_files=i + 1,
+                    written_records=written,
+                    filtered_records=filtered,
                     parse_errors=parse_errors,
                     shard_idx=shard_idx,
                 )
@@ -317,22 +476,7 @@ def main(argv: list[str] | None = None) -> int:
                 path, input_dir=input_dir, mode=args.source_path
             )
 
-            writer.write(json.dumps(ticket, ensure_ascii=False))
-            writer.write("\n")
-            written += 1
-            shard_records += 1
-
-            progress.update(
-                processed_files=i + 1,
-                written_records=written,
-                parse_errors=parse_errors,
-                shard_idx=shard_idx,
-            )
-
-            if shard_records >= args.records_per_shard and (i + 1) < len(files):
-                writer.close()
-                shard_idx += 1
-                shard_records = 0
+            if writer is None:
                 shard_path = _next_shard_path(
                     output_dir,
                     prefix=args.output_prefix,
@@ -341,23 +485,45 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 writer = _open_text_writer(shard_path, gzip_output=bool(args.gzip))
 
+            writer.write(json.dumps(ticket, ensure_ascii=False))
+            writer.write("\n")
+            written += 1
+            shard_records += 1
+
+            progress.update(
+                processed_files=i + 1,
+                written_records=written,
+                filtered_records=filtered,
+                parse_errors=parse_errors,
+                shard_idx=shard_idx,
+            )
+
+            if shard_records >= args.records_per_shard and (i + 1) < len(files):
+                writer.close()
+                writer = None
+                shard_idx += 1
+                shard_records = 0
+
     finally:
         try:
-            writer.close()
+            if writer is not None:
+                writer.close()
         except Exception:
             pass
         progress.update(
             processed_files=len(files),
             written_records=written,
+            filtered_records=filtered,
             parse_errors=parse_errors,
             shard_idx=shard_idx,
         )
         progress.finish()
 
     LOG.info(
-        "Done. Wrote %d ticket(s) into %d shard(s). Parse errors: %d.",
+        "Done. Wrote %d ticket(s) into %d shard(s). Filtered out: %d. Parse errors: %d.",
         written,
-        shard_idx + 1,
+        (shard_idx + 1) if written else 0,
+        filtered,
         parse_errors,
     )
     return 0

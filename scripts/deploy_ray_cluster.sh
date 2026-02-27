@@ -39,8 +39,8 @@ export HF_KEY="${HF_TOKEN:-}"
 TICKETS_JSONL_DIR="${TICKETS_JSONL_DIR:-${SCRATCH}/servicenow_incidents_jsonl}"
 
 # Output directories (host paths). Default to job-scoped scratch folders.
-KEPT_DIR="${KEPT_DIR:-${SCRATCH}/servicenow_incidents_processed/kept}"
-REJECTED_DIR="${REJECTED_DIR:-${SCRATCH}/servicenow_incidents_processed/rejected}"
+KEPT_DIR="${KEPT_DIR:-${SCRATCH}/servicenow_incidents_processed/qa_parquet}"
+REJECTED_DIR="${REJECTED_DIR:-${SCRATCH}/servicenow_incidents_processed/llm_rejected_parquet}"
 
 # Container mount points for the pipeline.
 MOUNT_TICKETS="/tickets"
@@ -50,6 +50,14 @@ MOUNT_REJECTED="/rejected"
 mkdir -p "${KEPT_DIR}" "${REJECTED_DIR}"
 
 export TICKETS_JSONL_DIR KEPT_DIR REJECTED_DIR MOUNT_TICKETS MOUNT_KEPT MOUNT_REJECTED
+
+#------------------------------------------------------------------------------
+# LLM pipeline runtime args (override via environment before sbatch)
+#------------------------------------------------------------------------------
+LLM_CONFIG="${LLM_CONFIG:-config/llm_pipeline.toml}"
+LIMIT_TICKETS="${LIMIT_TICKETS:-}"
+
+export LLM_CONFIG LIMIT_TICKETS
 
 # Logging function
 log() {
@@ -221,18 +229,17 @@ log "REJECTED_DIR=${REJECTED_DIR} (mounted at ${MOUNT_REJECTED})"
 
 # Edit PIPELINE_ARGS to add/remove flags as needed.
 PIPELINE_ARGS=(
-  --config config/qa_dataset.toml
   --input "${MOUNT_TICKETS}"
   --output-dir "${MOUNT_KEPT}"
   --rejected-dir "${MOUNT_REJECTED}"
-  --output-format jsonl
+  --llm-config "${LLM_CONFIG}"
   --overwrite
   --ray-address "${RAY_ADDRESS}"
   --log-level INFO
 )
 
-#
-# Optional: debug mode
-# PIPELINE_ARGS+=(--limit-files 1000)
+if [[ -n "${LIMIT_TICKETS}" ]]; then
+  PIPELINE_ARGS+=(--limit-tickets "${LIMIT_TICKETS}")
+fi
 
-PODMAN_WITH_RAY_TMPDIR=1 podman_llm python3 scripts/ray_servicenow_ticket_pipeline.py "${PIPELINE_ARGS[@]}"
+PODMAN_WITH_RAY_TMPDIR=1 podman_llm python3.11 scripts/ray_servicenow_ticket_pipeline.py "${PIPELINE_ARGS[@]}"
