@@ -22,7 +22,7 @@ mkdir -p ${RAY_TEMP_DIR}
 HEAD_NODE_TIMEOUT=300  # seconds to wait for head node
 WORKER_TIMEOUT=300  # seconds to wait for all workers to connect
 export PODMANHPC_ADDITIONAL_STORES=/dvs_ro/cfs/cdirs/dasrepo/podman_shared_images
-export RAY_IMAGE="rayproject/ray-llm:2.53.0-extra-py311-cu128"
+export RAY_IMAGE="rayproject/ray-llm:2.54.0-extra-py311-cu128"
 export HF_DIR="${HF_HOME:-${SCRATCH}/huggingface/}"
 HF_TOKEN="$(cat ~/.hf_token 2>/dev/null || true)"
 export HF_KEY="${HF_TOKEN:-}"

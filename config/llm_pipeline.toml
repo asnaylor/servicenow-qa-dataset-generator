@@ -2,17 +2,18 @@
 
 model_source = "openai/gpt-oss-120b"
 batch_size = 16
-max_model_len = 8192
-context_max_chars = 12000
+context_max_chars = 24000  # Optimized for 4x A100 40GB with 15.97 GiB KV cache per GPU
 
 [engine_kwargs]
 tensor_parallel_size = 4
-max_model_len = 8192
+max_model_len = 20480  # Conservative max for stable operation with available KV cache
+gpu_memory_utilization = 0.90
 
 [quality]
 temperature = 0.0
-max_tokens = 128
+max_tokens = 512
+score_threshold = 70  # Only keep tickets with score >= 70 (0-100 scale)
 
 [qa]
 temperature = 0.1
-max_tokens = 512
+max_tokens = 6144  # Ensures complete detailed answers with multiple solutions, extensive code examples, and full summaries

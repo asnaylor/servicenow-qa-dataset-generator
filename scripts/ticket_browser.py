@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Lightweight browser for kept/rejected ticket JSONL produced by the Ray pipeline.
+Lightweight browser for browsing ServiceNow ticket JSONL shards.
 
 Goals:
 - Arrow-key TUI for one-line summaries and drill-down viewing.
 - No third-party dependencies (standard library only).
 
 Supported inputs:
-- A directory produced by Ray `Dataset.write_json(...)` (many *.json files with JSONL).
+- A directory containing JSONL/JSON (optionally gzipped) shards.
 - A single JSONL/JSON file.
 
 Notes:
@@ -33,16 +33,23 @@ GZIP_SUFFIXES = (".gz",)
 
 @dataclass(frozen=True)
 class RecordRef:
-    dataset: str  # "kept" or "rejected"
     path: str
     offset: int | None  # byte offset for uncompressed files
+    line_no: int  # 0-based line number in file (used for gzip / fallback)
     incident_number: str
+    sys_id: str
     state: str
+    category: str
+    subcategory: str
+    u_resource: str
     short_description: str
-    rejection_reasons: tuple[str, ...]
+    close_code: str
+    source_path: str
+    # Precomputed lowercase blob for fast substring search.
+    search_blob: str
 
 
-def _iter_input_files(root: str) -> list[str]:
+def _iter_input_files(root: str, *, recursive: bool) -> list[str]:
     p = Path(root)
     if not p.exists():
         raise FileNotFoundError(f"Input not found: {root}")
@@ -51,7 +58,8 @@ def _iter_input_files(root: str) -> list[str]:
         return [str(p)]
 
     files: list[str] = []
-    for child in sorted(p.rglob("*")):
+    it = p.rglob("*") if recursive else p.glob("*")
+    for child in sorted(it):
         if not child.is_file():
             continue
         name = child.name.lower()
@@ -68,22 +76,23 @@ def _open_maybe_gzip(path: str, mode: str):
     return open(path, mode)  # noqa: P201
 
 
-def _iter_records_from_file(path: str) -> Iterator[tuple[int | None, dict[str, Any]]]:
+def _iter_records_from_file(path: str) -> Iterator[tuple[int | None, int, dict[str, Any]]]:
     """
-    Yield (offset, record) for each JSON line in the file.
+    Yield (offset, line_no, record) for each JSON line in the file.
 
     If the file is gzip-compressed, offset is None (not seekable in a useful way).
     """
     if path.lower().endswith(".gz"):
         with _open_maybe_gzip(path, "rt") as f:
-            for line in f:
+            for line_no, line in enumerate(f):
                 line = line.strip()
                 if not line:
                     continue
-                yield None, json.loads(line)
+                yield None, line_no, json.loads(line)
         return
 
     with _open_maybe_gzip(path, "rb") as f:
+        line_no = 0
         while True:
             offset = f.tell()
             line = f.readline()
@@ -95,45 +104,146 @@ def _iter_records_from_file(path: str) -> Iterator[tuple[int | None, dict[str, A
             try:
                 obj = json.loads(line.decode("utf-8"))
             except Exception:
+                line_no += 1
                 continue
-            yield offset, obj
+            yield offset, line_no, obj
+            line_no += 1
+
+
+def _norm(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _get_incident_fields(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    # convert_servicenow_tickets_to_jsonl.py emits nested incident_fields.
+    # Ray pipeline outputs are already flattened.
+    return _as_dict(record.get("incident_fields"))
+
+
+def _get_metadata(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _as_dict(record.get("metadata"))
+
+
+def _get_field(record: Mapping[str, Any], key: str) -> str:
+    """
+    Best-effort accessor across common schemas.
+
+    - filtered JSONL: incident_fields.<key>
+    - ray pipeline outputs: top-level <key>
+    """
+    v = record.get(key)
+    if v is not None and v != "":
+        return _norm(v)
+    incident = _get_incident_fields(record)
+    v = incident.get(key)
+    if v is not None and v != "":
+        return _norm(v)
+    return ""
 
 
 def _extract_one_line_fields(
     record: Mapping[str, Any],
-) -> tuple[str, str, str, tuple[str, ...]]:
-    incident_number = str(
+) -> tuple[str, str, str, str, str, str, str, str, str, str]:
+    incident = _get_incident_fields(record)
+    metadata = _get_metadata(record)
+
+    incident_number = _norm(
         record.get("incident_number")
+        or incident.get("number")
+        or metadata.get("incident_number")
         or record.get("number")
-        or ""
-    ).strip()
-    state = str(record.get("state") or "").strip()
-    short_description = str(record.get("short_description") or "").strip()
-    reasons_raw = record.get("rejection_reasons") or []
-    if isinstance(reasons_raw, list):
-        reasons = tuple(str(x) for x in reasons_raw if x)
+    )
+    sys_id = _norm(record.get("sys_id") or incident.get("sys_id") or metadata.get("sys_id"))
+    state = _get_field(record, "state")
+    category = _get_field(record, "category")
+    subcategory = _get_field(record, "subcategory")
+    u_resource = _get_field(record, "u_resource")
+    short_description = _get_field(record, "short_description")
+    close_code = _get_field(record, "close_code")
+    source_path = _norm(record.get("source_path"))
+
+    # Optional field from other tools; safe to keep for searching.
+    rejection_reasons = record.get("rejection_reasons") or []
+    if isinstance(rejection_reasons, list):
+        reasons_text = ",".join(_norm(x) for x in rejection_reasons if _norm(x))
     else:
-        reasons = (str(reasons_raw),) if reasons_raw else ()
-    return incident_number, state, short_description, reasons
+        reasons_text = _norm(rejection_reasons)
+
+    return (
+        incident_number,
+        sys_id,
+        state,
+        category,
+        subcategory,
+        u_resource,
+        short_description,
+        close_code,
+        source_path,
+        reasons_text,
+    )
 
 
-def _index_dataset(dataset_name: str, root: str, *, limit: int | None = None) -> list[RecordRef]:
+def _build_search_blob(parts: Iterable[str]) -> str:
+    return " ".join(p for p in (p.strip() for p in parts) if p).lower()
+
+
+def _index_tickets(root: str, *, recursive: bool, limit: int | None = None) -> list[RecordRef]:
     refs: list[RecordRef] = []
-    files = _iter_input_files(root)
+    files = _iter_input_files(root, recursive=recursive)
     for path in files:
-        for offset, rec in _iter_records_from_file(path):
+        for offset, line_no, rec in _iter_records_from_file(path):
             if not isinstance(rec, dict):
                 continue
-            incident_number, state, short_description, reasons = _extract_one_line_fields(rec)
+            (
+                incident_number,
+                sys_id,
+                state,
+                category,
+                subcategory,
+                u_resource,
+                short_description,
+                close_code,
+                source_path,
+                reasons_text,
+            ) = _extract_one_line_fields(rec)
+
+            search_blob = _build_search_blob(
+                (
+                    incident_number,
+                    sys_id,
+                    state,
+                    category,
+                    subcategory,
+                    u_resource,
+                    short_description,
+                    close_code,
+                    source_path,
+                    reasons_text,
+                )
+            )
             refs.append(
                 RecordRef(
-                    dataset=dataset_name,
                     path=path,
                     offset=offset,
+                    line_no=line_no,
                     incident_number=incident_number,
+                    sys_id=sys_id,
                     state=state,
+                    category=category,
+                    subcategory=subcategory,
+                    u_resource=u_resource,
                     short_description=short_description,
-                    rejection_reasons=reasons,
+                    close_code=close_code,
+                    source_path=source_path,
+                    search_blob=search_blob,
                 )
             )
             if limit is not None and len(refs) >= limit:
@@ -142,16 +252,11 @@ def _index_dataset(dataset_name: str, root: str, *, limit: int | None = None) ->
 
 
 def _format_row(ref: RecordRef, idx: int, *, width: int = 120) -> str:
-    tag = "K" if ref.dataset == "kept" else "R"
     incident = ref.incident_number or "-"
     state = ref.state or "-"
+    category = ref.category or "-"
     short = ref.short_description.replace("\n", " ").strip() or "-"
-    reasons = ""
-    if ref.dataset != "kept":
-        reasons = " reasons=" + ",".join(ref.rejection_reasons[:4])
-        if len(ref.rejection_reasons) > 4:
-            reasons += ",..."
-    base = f"[{tag}] {idx:6d}  {incident:12s}  {state:10s}  {short}{reasons}"
+    base = f"{idx:6d}  {incident:12s}  {state:10s}  {category:16.16s}  {short}"
     if len(base) <= width:
         return base
     return base[: max(0, width - 1)] + "…"
@@ -159,13 +264,9 @@ def _format_row(ref: RecordRef, idx: int, *, width: int = 120) -> str:
 
 def _load_record(ref: RecordRef) -> dict[str, Any] | None:
     if ref.offset is None:
-        # gzip: re-scan the file until we find a matching incident_number + short_description.
-        target = (ref.incident_number, ref.short_description)
-        for _, rec in _iter_records_from_file(ref.path):
-            if not isinstance(rec, dict):
-                continue
-            inc, _, short, _ = _extract_one_line_fields(rec)  # type: ignore[arg-type]
-            if (inc, short) == target:
+        # gzip: re-scan to the recorded line number.
+        for _, line_no, rec in _iter_records_from_file(ref.path):
+            if line_no == ref.line_no and isinstance(rec, dict):
                 return rec
         return None
 
@@ -204,9 +305,13 @@ def _record_to_detail_lines(rec: dict[str, Any], *, width: int, raw_json: bool) 
         return _wrap_lines(blob, width=width)
 
     lines: list[str] = []
+    incident = _as_dict(rec.get("incident_fields"))
+    discussions = _as_dict(rec.get("discussions"))
 
     def add_kv(key: str) -> None:
         v = rec.get(key)
+        if v is None or v == "":
+            v = incident.get(key)
         if v is None or v == "":
             return
         if isinstance(v, (dict, list)):
@@ -229,27 +334,43 @@ def _record_to_detail_lines(rec: dict[str, Any], *, width: int, raw_json: bool) 
         "assigned_to",
         "sys_created_by",
         "contact_type",
-        "rejection_reasons",
+        "category",
+        "subcategory",
+        "u_resource",
+        "close_code",
         "source_path",
     ):
         add_kv(k)
 
     lines.append("")
 
-    for k in (
-        "short_description",
-        "description",
-        "customer_comments_text",
-        "internal_work_notes_text",
-        "close_notes",
-    ):
-        v = rec.get(k)
-        if v is None or v == "":
-            continue
-        lines.append(f"{k}:")
-        for w in _wrap_lines(str(v), width=max(10, width - 2)):
+    def add_block(label: str, value: Any) -> None:
+        s = _norm(value)
+        if not s:
+            return
+        lines.append(f"{label}:")
+        for w in _wrap_lines(s, width=max(10, width - 2)):
             lines.append("  " + w)
         lines.append("")
+
+    def join_discussions(key: str) -> str:
+        entries = discussions.get(key)
+        if not isinstance(entries, list):
+            return ""
+        out: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            t = _norm(entry.get("text"))
+            if t:
+                out.append(t)
+        return "\n\n".join(out)
+
+    add_block("short_description", incident.get("short_description") or rec.get("short_description"))
+    add_block("description", incident.get("description") or rec.get("description"))
+    add_block("close_notes", incident.get("close_notes") or rec.get("close_notes"))
+    add_block("customer_facing_comments", join_discussions("customer_facing_comments"))
+    add_block("internal_work_notes", join_discussions("internal_work_notes"))
 
     if lines and lines[-1] == "":
         lines.pop()
@@ -263,41 +384,74 @@ def run_tui(args: argparse.Namespace) -> int:
     except Exception as e:
         raise SystemExit(f"curses is required for tui mode: {e}")
 
-    refs: list[RecordRef] = []
-    if args.kept:
-        refs.extend(_index_dataset("kept", args.kept, limit=args.limit_index))
-    if args.rejected:
-        refs.extend(_index_dataset("rejected", args.rejected, limit=args.limit_index))
+    refs = _index_tickets(
+        args.input,
+        recursive=not bool(args.no_recursive),
+        limit=args.limit_index,
+    )
 
     if not refs:
         print("No records found.")
         return 2
 
-    query = ""
+    query = args.query or ""
     visible: list[int] = list(range(len(refs)))
     selected_pos = 0
     top = 0
-    mode: str = "all"  # all|kept|rejected
 
     def apply_filter() -> None:
         nonlocal visible, selected_pos, top
-        q = query.strip().lower()
+        q = query.strip()
+        q_l = q.lower()
         out: list[int] = []
+
+        # Support simple "field:value" filters mixed with free-text tokens.
+        # Examples:
+        # - state:closed vpn
+        # - category:network subcategory:wifi
+        filters: list[tuple[str, str]] = []
+        terms: list[str] = []
+        for tok in (t for t in q.split() if t.strip()):
+            if ":" in tok and not tok.startswith(":") and not tok.endswith(":"):
+                k, v = tok.split(":", 1)
+                k = k.strip().lower()
+                v = v.strip().lower()
+                if k and v:
+                    filters.append((k, v))
+                    continue
+            terms.append(tok.lower())
+
         for idx, r in enumerate(refs):
-            if mode != "all" and r.dataset != mode:
-                continue
             if not q:
                 out.append(idx)
                 continue
-            if q in (r.incident_number or "").lower():
-                out.append(idx)
+
+            ok = True
+            for k, v in filters:
+                if k in ("incident", "incident_number", "number"):
+                    ok = v in (r.incident_number or "").lower()
+                elif k in ("sys_id", "sysid"):
+                    ok = v in (r.sys_id or "").lower()
+                elif k == "state":
+                    ok = v in (r.state or "").lower()
+                elif k == "category":
+                    ok = v in (r.category or "").lower()
+                elif k == "subcategory":
+                    ok = v in (r.subcategory or "").lower()
+                elif k in ("resource", "u_resource"):
+                    ok = v in (r.u_resource or "").lower()
+                elif k in ("close_code", "closecode"):
+                    ok = v in (r.close_code or "").lower()
+                elif k in ("source", "source_path", "path"):
+                    ok = v in (r.source_path or "").lower()
+                else:
+                    ok = v in r.search_blob
+                if not ok:
+                    break
+            if not ok:
                 continue
-            if q in (r.short_description or "").lower():
+            if all(t in r.search_blob for t in terms):
                 out.append(idx)
-                continue
-            if q in ",".join(r.rejection_reasons).lower():
-                out.append(idx)
-                continue
         visible = out
         selected_pos = 0
         top = 0
@@ -331,14 +485,15 @@ def run_tui(args: argparse.Namespace) -> int:
         nonlocal selected_pos, top
         stdscr.erase()
         h, w = stdscr.getmaxyx()
+        max_w = min(max(20, w - 1), int(args.width))
 
-        title = f"Tickets: {len(refs)}  Visible: {len(visible)}  Mode: {mode}"
+        title = f"Tickets: {len(refs)}  Visible: {len(visible)}"
         if query:
             title += f"  Search: {query!r}"
-        stdscr.addstr(0, 0, title[: max(0, w - 1)])
+        stdscr.addstr(0, 0, title[: max(0, max_w)])
 
-        help_line = "↑/↓ move  Home/End start/end  PgUp/PgDn page  Enter details  t mode  / search  q quit"
-        stdscr.addstr(h - 1, 0, help_line[: max(0, w - 1)])
+        help_line = "↑/↓ move  Home/End start/end  PgUp/PgDn page  Enter details  / search  q quit"
+        stdscr.addstr(h - 1, 0, help_line[: max(0, max_w)])
 
         if not visible:
             stdscr.addstr(2, 0, "No matches. Press / to search again or clear.")
@@ -355,7 +510,7 @@ def run_tui(args: argparse.Namespace) -> int:
         end = min(len(visible), top + list_h)
         for row, pos in enumerate(range(top, end), start=1):
             idx = visible[pos]
-            line = _format_row(refs[idx], idx, width=w - 1)
+            line = _format_row(refs[idx], idx, width=max_w)
             if pos == selected_pos:
                 with contextlib.suppress(Exception):
                     stdscr.addstr(row, 0, line, curses.A_REVERSE)
@@ -373,12 +528,13 @@ def run_tui(args: argparse.Namespace) -> int:
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
-            header = _format_row(ref, -1, width=w - 1).replace("[-1", "[sel")
-            stdscr.addstr(0, 0, header[: max(0, w - 1)])
+            max_w = min(max(20, w - 1), int(args.width))
+            header = _format_row(ref, -1, width=max_w).replace("-1", "sel")
+            stdscr.addstr(0, 0, header[: max(0, max_w)])
             help_line = "Esc back  ↑/↓ scroll  g/G start/end  PgUp/PgDn page  j toggle json  / search  q quit"
-            stdscr.addstr(h - 1, 0, help_line[: max(0, w - 1)])
+            stdscr.addstr(h - 1, 0, help_line[: max(0, max_w)])
 
-            lines = _record_to_detail_lines(rec, width=max(20, w - 1), raw_json=raw_json)
+            lines = _record_to_detail_lines(rec, width=max_w, raw_json=raw_json)
             body_h = max(0, h - 2)
             scroll = max(0, min(scroll, max(0, len(lines) - body_h)))
 
@@ -430,7 +586,7 @@ def run_tui(args: argparse.Namespace) -> int:
                 return
 
     def main_curses(stdscr: Any) -> int:
-        nonlocal selected_pos, top, query, mode
+        nonlocal selected_pos, top, query
         curses.curs_set(0)
         stdscr.keypad(True)
 
@@ -444,10 +600,6 @@ def run_tui(args: argparse.Namespace) -> int:
                 return 0
             if ch == ord("/"):
                 query = prompt(stdscr, "search> ")
-                apply_filter()
-                continue
-            if ch in (ord("t"), ord("T")):
-                mode = "kept" if mode == "all" else "rejected" if mode == "kept" else "all"
                 apply_filter()
                 continue
 
@@ -490,16 +642,18 @@ def run_tui(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Arrow-key TUI for browsing kept/rejected ticket outputs.",
+        description="Arrow-key TUI for browsing ticket JSONL shards.",
     )
-    parser.add_argument("--kept", default=None, help="Kept dataset dir/file (Ray write_json output).")
-    parser.add_argument("--rejected", default=None, help="Rejected dataset dir/file (Ray write_json output).")
-    parser.add_argument("--width", type=int, default=140, help="Max width for one-line rows.")
+    parser.add_argument(
+        "--input",
+        default="/mscratch/sd/a/asnaylor/servicenow_incidents_jsonl_filtered/",
+        help="Ticket JSONL directory/file to browse (default: /mscratch/.../servicenow_incidents_jsonl_filtered/).",
+    )
+    parser.add_argument("--no-recursive", action="store_true", help="Disable recursive file discovery.")
+    parser.add_argument("--query", default=None, help="Initial search query (supports field:value tokens).")
+    parser.add_argument("--width", type=int, default=160, help="Max width for rendered rows/details.")
     parser.add_argument("--limit-index", type=int, default=None, help="Limit indexed records (debug).")
     args = parser.parse_args(argv)
-
-    if not args.kept and not args.rejected:
-        parser.error("Provide --kept and/or --rejected.")
 
     return int(run_tui(args))
 

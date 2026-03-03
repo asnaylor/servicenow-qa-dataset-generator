@@ -26,14 +26,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Pattern
-
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
-    except ImportError:
-        tomllib = None  # type: ignore[assignment]
+import tomllib
 
 
 LOG = logging.getLogger("convert_servicenow_tickets_to_jsonl")
@@ -61,10 +54,6 @@ class RejectionConfig:
 
 
 def _load_toml_config(config_path: str) -> dict[str, Any]:
-    if tomllib is None:
-        raise SystemExit(
-            "TOML support not available. Install `tomli` for Python <3.11, or use Python 3.11+."
-        )
     with open(config_path, "rb") as f:
         return tomllib.load(f)
 
