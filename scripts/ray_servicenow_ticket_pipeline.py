@@ -200,93 +200,177 @@ def _smart_truncate_at_sentence(text: str, max_chars: int) -> str:
     return truncated.rstrip() + "..."
 
 
-def _extract_comments_smart(entries: Any, budget_chars: int, prioritize_resolution: bool = True) -> str:
-    """Extract comments with smart truncation, prioritizing resolution info."""
+# Boilerplate close_notes patterns that contain no useful resolution info.
+_BOILERPLATE_CLOSE_NOTES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"^questions? answered\.?$",
+        r"^resolved with no close notes\.?$",
+        r"^resolved by (user|requester) with comment:",
+        r"^closed by (user|requester)\.?$",
+        r"^user resolved\.?$",
+        r"^no (additional )?information provided\.?$",
+    ]
+)
+
+# Patterns to strip email threading artifacts from comment text.
+_EMAIL_ARTIFACT_RE = re.compile(
+    r"(reply from:.*?(\n|$))"          # "reply from: user@example.com"
+    r"|(__+\s*\nFrom:)"                 # "________________________________\nFrom:"
+    r"|(^From:\s*\n)",                  # bare "From:" at start
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# HTML-style code block wrappers used by the ServiceNow web UI.
+_HTML_CODE_RE = re.compile(
+    r"\[code\]\s*<pre><code>(.*?)</code></pre>\s*\[/code\]",
+    re.DOTALL | re.IGNORECASE,
+)
+def _is_noise_comment(entry: dict[str, Any]) -> bool:
+    """Return True for system-generated or low-signal comments to skip."""
+    creator = _norm(entry.get("created_by")).lower()
+    if creator == "system":
+        return True
+    text = _norm(entry.get("text")).lower()
+    # Auto-close boilerplate
+    if "incident automatically closed" in text:
+        return True
+    return False
+
+
+def _clean_comment_text(text: str) -> str:
+    """Strip known noise patterns from a comment string."""
+    # Unwrap ServiceNow [code]<pre><code>...</code></pre>[/code] → keep the code content
+    text = _HTML_CODE_RE.sub(lambda m: "\n" + m.group(1).strip() + "\n", text)
+    # Strip email threading artifacts
+    text = _EMAIL_ARTIFACT_RE.sub("", text)
+    # Collapse excessive blank lines left by stripping
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _is_boilerplate_close_notes(text: str) -> bool:
+    """Return True if close_notes contains no useful resolution info."""
+    t = text.strip()
+    return any(p.search(t) for p in _BOILERPLATE_CLOSE_NOTES)
+
+
+# PII redaction patterns applied to all free-text fields in the final output.
+# Tuples of (compiled_pattern, replacement_string).
+_PII_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Email addresses → [EMAIL]
+    (re.compile(r"\b[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}\b"), "[EMAIL]"),
+    # NERSC home paths: /global/homes/<letter>/<username> → /global/homes/[USER]
+    (re.compile(r"/global/homes/[a-z]/\w+"), "/global/homes/[USER]"),
+    # NERSC scratch paths: /pscratch/<letter>/<username>
+    (re.compile(r"/pscratch/[a-z]/\w+"), "/pscratch/[USER]"),
+    # ServiceNow display name: "Lastname, Firstname (username)" or "Lastname, Firstname"
+    (
+        re.compile(
+            r"\b[A-Z][a-z]+(?:[- ][A-Z][a-z]+)?,\s+[A-Z][a-z]+(?:[- ][A-Z][a-z]+)?"
+            r"(?:\s+\(\w+\))?(?=\s|$|[,.])"
+        ),
+        "[NAME]",
+    ),
+)
+
+
+def _redact_pii(text: str) -> str:
+    """Apply regex-based PII redaction to a free-text field."""
+    for pattern, replacement in _PII_REDACT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+
+def _extract_comments_smart(entries: Any, budget_chars: int) -> str:
+    """
+    Extract comments in chronological order with noise filtering and text cleaning.
+
+    Changes from original:
+    - Chronological order (oldest first) so the problem-solving arc is preserved.
+    - Skips system/auto-close noise entries (_is_noise_comment).
+    - Cleans each comment text (strips HTML, email artifacts).
+    - Removed prioritize_resolution reversal (was burying initial user reports).
+    """
     if not isinstance(entries, list) or not entries:
         return ""
 
-    # Extract and clean all comments
-    comments = []
-    for entry in entries:
+    # Filter noise and clean text.
+    # The JSON stores comments newest-first; reverse to chronological order so
+    # the initial user report (most diagnostic) appears first in context.
+    comments: list[str] = []
+    for entry in reversed(entries):
         if not isinstance(entry, dict):
             continue
-        text = _norm(entry.get("text"))
+        if _is_noise_comment(entry):
+            continue
+        text = _clean_comment_text(_norm(entry.get("text")))
         if text:
             comments.append(text)
 
     if not comments:
         return ""
 
-    # If prioritizing resolution, reverse to get latest (resolution) comments first
-    if prioritize_resolution and len(comments) > 1:
-        comments = list(reversed(comments))
-
     # Build output staying within budget
-    result = []
+    result: list[str] = []
     used_chars = 0
 
     for i, comment in enumerate(comments):
-        # Reserve space for "...[X more]" if needed
         remaining = budget_chars - used_chars
         if i < len(comments) - 1:
-            remaining -= 20  # Reserve for truncation message
+            remaining -= 20  # Reserve space for truncation message
 
-        if remaining <= 50:  # Not enough space
+        if remaining <= 50:
             omitted = len(comments) - i
             if omitted > 0:
                 result.append(f"...[{omitted} more comment(s) omitted]")
             break
 
-        # Truncate this comment if needed
         if len(comment) > remaining:
             comment = _smart_truncate_at_sentence(comment, remaining)
 
         result.append(comment)
         used_chars += len(comment)
 
-    # Restore original order if we reversed
-    if prioritize_resolution and len(result) > 1 and not result[-1].startswith("...["):
-        result = list(reversed(result))
-
     return "\n\n".join(result)
 
 
 def _ticket_to_context(ticket: Mapping[str, Any], *, max_chars: int) -> str:
     """
-    Smart ticket context extraction with hierarchical token budgeting.
+    Ticket context extraction with noise filtering and hierarchical token budgeting.
 
     Token budget allocation (% of max_chars):
-    - Metadata (category, resource, etc.):  10%
-    - Problem description:                  15%
-    - Resolution (close notes):             25%
-    - Customer comments:                    25%
-    - Internal notes:                       25%
+    - Metadata (resource, category, user_category, close_code):  10%
+    - Problem description (short_description + description):      15%
+    - Resolution (close_notes, only if non-boilerplate):         20%
+    - Customer comments (chronological, noise-filtered):         30%
+    - Internal work notes (chronological, noise-filtered):       25%
+
+    If close_notes is boilerplate (empty/formulaic), its 20% is redistributed
+    equally to comments and work notes.
+
+    TODO: Add attachment_texts section (10% budget) once the converter inlines
+    plain-text attachment content into the JSONL records. The section would slot
+    in between Resolution and Comments, and budget would be taken from comments.
     """
     incident = ticket.get("incident_fields") or {}
     discussions = ticket.get("discussions") or {}
-    metadata = ticket.get("metadata") or {}
 
     if not isinstance(incident, dict):
         incident = {}
     if not isinstance(discussions, dict):
         discussions = {}
-    if not isinstance(metadata, dict):
-        metadata = {}
 
-    # Allocate character budgets
+    # --- Metadata section ---
     budget_metadata = int(max_chars * 0.10)
-    budget_problem = int(max_chars * 0.15)
-    budget_resolution = int(max_chars * 0.25)
-    budget_comments = int(max_chars * 0.25)
-    budget_notes = int(max_chars * 0.25)
-
-    # Build compact metadata section
     resource = _norm(incident.get("u_resource"))
     category = _norm(incident.get("category"))
     subcategory = _norm(incident.get("subcategory"))
     close_code = _norm(incident.get("close_code"))
+    user_category = _norm(incident.get("u_user_category"))
 
-    metadata_parts = []
+    metadata_parts: list[str] = []
     if resource:
         metadata_parts.append(f"Resource: {resource}")
     if category:
@@ -294,6 +378,8 @@ def _ticket_to_context(ticket: Mapping[str, Any], *, max_chars: int) -> str:
         if subcategory:
             cat_str += f" > {subcategory}"
         metadata_parts.append(f"Category: {cat_str}")
+    if user_category and user_category.lower() not in ("important", "other", ""):
+        metadata_parts.append(f"User category: {user_category}")
     if close_code:
         metadata_parts.append(f"Resolved: {close_code}")
 
@@ -301,7 +387,8 @@ def _ticket_to_context(ticket: Mapping[str, Any], *, max_chars: int) -> str:
     if len(metadata_section) > budget_metadata:
         metadata_section = _smart_truncate_at_sentence(metadata_section, budget_metadata)
 
-    # Problem description (short desc + description field)
+    # --- Problem description ---
+    budget_problem = int(max_chars * 0.15)
     short_desc = _norm(incident.get("short_description"))
     description = _norm(incident.get("description"))
 
@@ -317,47 +404,48 @@ def _ticket_to_context(ticket: Mapping[str, Any], *, max_chars: int) -> str:
     elif description:
         problem_section = _smart_truncate_at_sentence(description, budget_problem)
 
-    # Resolution info (close notes) - HIGH PRIORITY
+    # --- Resolution (close_notes) — skip if boilerplate ---
+    budget_resolution = int(max_chars * 0.20)
     close_notes = _norm(incident.get("close_notes"))
     resolution_section = ""
-    if close_notes:
+    resolution_budget_freed = 0
+    if close_notes and not _is_boilerplate_close_notes(close_notes):
         resolution_section = _smart_truncate_at_sentence(close_notes, budget_resolution)
+    else:
+        # Freed budget redistributed to comments and notes below
+        resolution_budget_freed = budget_resolution
 
-    # Customer comments - prioritize resolution (latest) comments
+    # --- Comments and work notes (chronological, noise-filtered) ---
+    extra = resolution_budget_freed // 2
+    budget_comments = int(max_chars * 0.30) + extra
+    budget_notes = int(max_chars * 0.25) + extra
+
     comments_section = _extract_comments_smart(
         discussions.get("customer_facing_comments"),
         budget_comments,
-        prioritize_resolution=True
     )
-
-    # Internal work notes - prioritize resolution
     notes_section = _extract_comments_smart(
         discussions.get("internal_work_notes"),
         budget_notes,
-        prioritize_resolution=True
     )
 
-    # Assemble final context with compact formatting
-    sections = []
+    # --- Assemble ---
+    sections: list[str] = []
 
     if metadata_section:
         sections.append(metadata_section)
-
     if problem_section:
         sections.append(f"\n{problem_section}")
-
     if resolution_section:
         sections.append(f"\nResolution:\n{resolution_section}")
-
+    # TODO: insert attachments_section here once converter inlines attachment_texts
     if comments_section:
         sections.append(f"\nComments:\n{comments_section}")
-
     if notes_section:
         sections.append(f"\nWork Notes:\n{notes_section}")
 
     context = "\n".join(sections)
 
-    # Final safety check (should rarely trigger now)
     if len(context) > max_chars:
         context = _smart_truncate_at_sentence(context, max_chars)
 
@@ -529,9 +617,12 @@ def _build_qa_preprocess(
     context_chars: int,
 ):
     system_prompt = (
-        "You are an expert technical writer. Convert a ServiceNow incident ticket "
-        "into a concise synthetic Q&A pair for training. "
-        "Output must follow the JSON schema."
+        "You are a knowledge base curator for a high-performance computing (HPC) support centre. "
+        "Your task is to convert a resolved support ticket into a Q&A record for a "
+        "retrieval-augmented generation (RAG) database used to help future users with similar problems.\n\n"
+        "Your role is to faithfully capture what actually happened in the ticket. "
+        "Do not write a tutorial, add general advice, or include any information "
+        "not explicitly stated by the user or support staff."
     )
 
     # Determine which key to use for structured outputs based on Ray version
@@ -541,18 +632,41 @@ def _build_qa_preprocess(
     def preprocess(row: dict[str, Any]) -> dict[str, Any]:
         context = _norm(row.get("ticket_context"))[:context_chars]
         user_prompt = (
-            "Return ONLY valid JSON with keys:\n"
-            "- question (string)\n"
-            "- answer (string)\n"
-            "- summary (string)\n"
-            "- tags (array of strings)\n"
-            "The answer must be grounded in the ticket details.\n\n"
-            "Constraints:\n"
-            "- Output MUST be a single JSON object (no markdown, no code fences, no extra text).\n"
-            "- Keep question detailed and specific (under 800 characters).\n"
-            "- Keep summary comprehensive (under 400 characters).\n"
-            "- Keep answer detailed (under 6400 characters) with concrete steps, commands, and explanations.\n"
-            "- tags: 1-8 short strings.\n\n"
+            "Convert the ticket below into a JSON object with exactly these keys: "
+            "question, answer, summary, tags.\n\n"
+
+            "QUESTION\n"
+            "Write a realistic first-person query as the user would have typed it. "
+            "Include the specific error, system, and anything the user already tried. "
+            "Do not add meta-instructions such as 'please include...', "
+            "'provide steps for...', or 'explain...' — the question describes a "
+            "situation, not a desired answer format. Under 800 characters.\n\n"
+
+            "ANSWER\n"
+            "Base the answer strictly on what is explicitly stated in the ticket. "
+            "The comments are in chronological order — use this to distinguish what "
+            "was tried from what ultimately worked.\n"
+            "• State the confirmed working solution clearly and first.\n"
+            "• If an approach was tried and failed, say so explicitly "
+            "(e.g. 'X was tried but did not work').\n"
+            "• Do not add steps, commands, flags, or advice not present in the ticket.\n"
+            "• Match answer length to the solution's complexity: "
+            "a two-command fix needs a short answer, not eight steps.\n"
+            "• Attachment content is not available. Do not reference attachments "
+            "in the question or answer, and do not infer content from them.\n"
+            "• Do not include email addresses or personal paths "
+            "(e.g. /global/homes/<user>/ or /pscratch/<user>/). Under 6400 characters.\n\n"
+
+            "SUMMARY\n"
+            "One sentence, under 350 characters. State the problem and the confirmed fix. "
+            "Stop writing before you reach the limit — do not let it cut off mid-sentence.\n\n"
+
+            "TAGS\n"
+            "1–8 short technical terms drawn directly from the ticket "
+            "(software names, error types, system names, commands).\n\n"
+
+            "Output ONLY a valid JSON object. No markdown wrapping, no code fences around the JSON.\n\n"
+
             f"Ticket:\n{context}"
         )
         return {
@@ -624,14 +738,15 @@ def _to_output_record(row: dict[str, Any]) -> dict[str, Any]:
         "category": _norm(row.get("category")),
         "subcategory": _norm(row.get("subcategory")),
         "u_resource": _norm(row.get("u_resource")),
-        "short_description": _norm(row.get("short_description")),
+        "short_description": _redact_pii(_norm(row.get("short_description"))),
         "close_code": _norm(row.get("close_code")),
-        "qa_question": _norm(row.get("qa_question")),
-        "qa_answer": _norm(row.get("qa_answer")),
-        "qa_summary": _norm(row.get("qa_summary")),
+        "qa_question": _redact_pii(_norm(row.get("qa_question"))),
+        "qa_answer": _redact_pii(_norm(row.get("qa_answer"))),
+        "qa_summary": _redact_pii(_norm(row.get("qa_summary"))),
         "qa_tags": row.get("qa_tags") or [],
-        "quality_reason": _norm(row.get("quality_reason")),
-        "original_ticket_json": _norm(row.get("original_ticket_json")),
+        "quality_reason": _redact_pii(_norm(row.get("quality_reason"))),
+        # original_ticket_json intentionally omitted — contains raw PII.
+        # Traceability is provided by incident_number + sys_id.
     }
 
 
