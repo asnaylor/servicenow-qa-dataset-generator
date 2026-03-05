@@ -1,5 +1,11 @@
 # Configuration for filtering ServiceNow tickets into a Q&A dataset
 
+[date]
+# Reject tickets opened before this date (ISO format YYYY-MM-DD).
+# 2021-05-01 = Perlmutter early access start; tickets before this are Cori-era.
+# Leave empty ("") to disable the cutoff.
+min_opened_date = "2021-05-01"
+
 [state]
 allowed_states = ["Closed", "Resolved"]
 
@@ -35,6 +41,26 @@ rejected = [
     "account support",
     "Workstation Support",
     "Hardware"
+]
+
+[assignment_groups]
+# Tickets assigned to these groups are internal ops work, not user-facing support.
+# Kept groups (not listed here): Consulting, DAS, Spin POC, Jupyter POC, PEM,
+# JGI Consultants, HPC Services.
+rejected = [
+    "Networking",
+    "HPSS Admin",
+    "ISG",
+    "ISG-JGI",
+    "OTG",
+    "OTG POC",
+    "Security",
+    "HPC POC",
+    "IRIS",
+    "Allocations",
+    "ServiceNow Admins",
+    "Workstation Support",
+    "NGF Admin",
 ]
 
 [resources]

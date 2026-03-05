@@ -159,19 +159,6 @@ def _norm(value: Any) -> str:
     return str(value).strip()
 
 
-def _join_text_entries(entries: Any) -> str:
-    if not isinstance(entries, list):
-        return ""
-    out: list[str] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        text = _norm(entry.get("text"))
-        if text:
-            out.append(text)
-    return "\n\n".join(out)
-
-
 def _serialize_ticket_json(ticket: Mapping[str, Any]) -> str:
     try:
         return json.dumps(ticket, sort_keys=True, separators=(",", ":"))
@@ -541,6 +528,11 @@ def _build_quality_preprocess(
             "Examples: 85+=detailed error+commands, 70-84=clear problem+steps, "
             "50-69=generic fix, <50=vague/admin. Keep if score>=70. Be strict.\n\n"
 
+            "Automatic reject (score <= 30):\n"
+            "• Ticket is primarily about a decommissioned NERSC system: Cori, KNL, "
+            "Haswell (Cori partition), or Edison. A passing mention of Cori as context "
+            "is fine; reject only when the decommissioned system is the subject.\n\n"
+
             "IMPORTANT: Keep reason under 20 words. Just state key strengths/weaknesses.\n\n"
 
             f"Ticket:\n{context}"
@@ -631,6 +623,13 @@ def _build_qa_preprocess(
 
     def preprocess(row: dict[str, Any]) -> dict[str, Any]:
         context = _norm(row.get("ticket_context"))[:context_chars]
+        docs_ctx = _norm(row.get("docs_context"))
+        docs_block = (
+            "\nReference documentation (use only if directly relevant to this ticket — "
+            "never invent steps or commands not in the ticket itself):\n"
+            + docs_ctx
+            + "\n"
+        ) if docs_ctx else ""
         user_prompt = (
             "Convert the ticket below into a JSON object with exactly these keys: "
             "question, answer, summary, tags.\n\n"
@@ -667,6 +666,7 @@ def _build_qa_preprocess(
 
             "Output ONLY a valid JSON object. No markdown wrapping, no code fences around the JSON.\n\n"
 
+            f"{docs_block}"
             f"Ticket:\n{context}"
         )
         return {
@@ -748,6 +748,120 @@ def _to_output_record(row: dict[str, Any]) -> dict[str, Any]:
         # original_ticket_json intentionally omitted — contains raw PII.
         # Traceability is provided by incident_number + sys_id.
     }
+
+
+# ---------------------------------------------------------------------------
+# NERSC docs retrieval (FAISS + sentence-transformers)
+# ---------------------------------------------------------------------------
+
+# Module-level cache keyed by (index_prefix, model_name) so each Ray worker
+# process loads the index and embedding model only once.
+_DOCS_INDEX_CACHE: dict[tuple[str, str], Any] = {}
+
+
+def _load_docs_index(index_prefix: str, model_name: str) -> Any | None:
+    """
+    Load the FAISS index, chunk metadata, and embedding model.
+
+    Returns a (faiss_index, chunks, model) tuple, or None if the index files
+    are missing or the required libraries are not installed.  Results are cached
+    per (index_prefix, model_name) within the current process so Ray workers
+    only pay the load cost once.
+    """
+    cache_key = (index_prefix, model_name)
+    if cache_key in _DOCS_INDEX_CACHE:
+        return _DOCS_INDEX_CACHE[cache_key]
+
+    faiss_path = index_prefix + ".faiss"
+    meta_path = index_prefix + ".jsonl"
+
+    if not Path(faiss_path).exists() or not Path(meta_path).exists():
+        LOG.warning("Docs index files not found at prefix: %s", index_prefix)
+        return None
+
+    try:
+        import faiss  # type: ignore[import-not-found]
+    except ImportError:
+        LOG.warning("faiss not installed; skipping docs retrieval. Install with: pip install faiss-cpu")
+        return None
+
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
+    except ImportError:
+        LOG.warning(
+            "sentence-transformers not installed; skipping docs retrieval. "
+            "Install with: pip install sentence-transformers"
+        )
+        return None
+
+    index = faiss.read_index(faiss_path)
+    chunks: list[dict[str, str]] = []
+    with open(meta_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                chunks.append(json.loads(line))
+
+    model = SentenceTransformer(model_name)
+    result = (index, chunks, model)
+    _DOCS_INDEX_CACHE[cache_key] = result
+    LOG.info(
+        "Loaded docs index: %d chunks, model=%s (process-cached)",
+        len(chunks),
+        model_name,
+    )
+    return result
+
+
+def _build_docs_retriever(index_prefix: str, *, top_k: int, model_name: str):
+    """
+    Return a per-row map function that adds a ``docs_context`` field.
+
+    The query is built from the ticket's short_description.  Top-k matching
+    documentation chunks are formatted and stored as a single string so the
+    QA preprocess can include them in the synthesis prompt.
+    """
+    def retrieve(row: dict[str, Any]) -> dict[str, Any]:
+        loaded = _load_docs_index(index_prefix, model_name)
+        if loaded is None:
+            return {**row, "docs_context": "", "docs_chunks": []}
+
+        faiss_index, chunks, model = loaded
+
+        query = _norm(row.get("short_description"))
+        if not query:
+            return {**row, "docs_context": "", "docs_chunks": []}
+
+        embedding = model.encode(
+            [query],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).astype("float32")
+
+        k = min(top_k, len(chunks))
+        _, indices = faiss_index.search(embedding, k)
+
+        doc_sections: list[str] = []
+        retrieved_headings: list[str] = []
+        for idx in indices[0]:
+            if 0 <= idx < len(chunks):
+                chunk = chunks[idx]
+                # Include the section title as a heading so the LLM can cite it.
+                heading = f"{chunk['page_title']} — {chunk['section_heading']}"
+                # Trim chunk text so the docs block doesn't dominate the prompt.
+                text = chunk["text"][:1000]
+                doc_sections.append(f"[{heading}]\n{text}")
+                retrieved_headings.append(heading)
+
+        LOG.debug(
+            "docs_retrieval incident=%s chunks=%s",
+            _norm(row.get("incident_number")),
+            retrieved_headings,
+        )
+        docs_context = "\n\n---\n\n".join(doc_sections)
+        return {**row, "docs_context": docs_context, "docs_chunks": retrieved_headings}
+
+    return retrieve
 
 
 def _load_toml_config(config_path: str) -> dict[str, Any]:
@@ -834,6 +948,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path to LLM TOML config (default: config/llm_pipeline.toml).",
     )
     parser.add_argument(
+        "--docs-index",
+        default=None,
+        help=(
+            "Path prefix to the NERSC docs FAISS index built by scripts/index_nersc_docs.py "
+            "(e.g. /path/to/nersc_docs_index). Creates <prefix>.faiss and <prefix>.jsonl. "
+            "Omit to skip documentation retrieval."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -898,6 +1021,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     qa_temperature = float(qa_cfg.get("temperature", 0.1))
     qa_max_tokens = int(qa_cfg.get("max_tokens", 512))
 
+    docs_cfg = llm_cfg.get("docs", {})
+    if not isinstance(docs_cfg, dict):
+        docs_cfg = {}
+    docs_top_k = int(docs_cfg.get("top_k", 3))
+    docs_model = str(docs_cfg.get("model", "BAAI/bge-small-en-v1.5"))
+
     base_engine_kwargs = llm_cfg.get("engine_kwargs", {})
     tensor_parallel_size = max(1, int(base_engine_kwargs.get("tensor_parallel_size", 1)))
 
@@ -928,6 +1057,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "concurrency": concurrency,
         "batch_size": batch_size,
     }
+    #TO-DO add ability to switch out from local vllm to openai server - https://docs.ray.io/en/latest/data/api/doc/ray.data.llm.HttpRequestProcessorConfig.html
     quality_processor = build_processor(
         config=vLLMEngineProcessorConfig(**quality_engine_config_kwargs),
         preprocess=_build_quality_preprocess(
@@ -962,6 +1092,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         rejected_out.write_parquet(args.rejected_dir)
         LOG.info("Wrote rejected quality records to %s", args.rejected_dir)
+
+    # --- NERSC docs retrieval (optional) ---
+    # Adds a `docs_context` field to each kept ticket with the most relevant
+    # documentation sections, retrieved via FAISS cosine similarity search on
+    # the ticket's short_description.
+    if args.docs_index:
+        LOG.info(
+            "Adding NERSC docs context (index=%s, top_k=%d, model=%s) ...",
+            args.docs_index,
+            docs_top_k,
+            docs_model,
+        )
+        kept_ds = kept_ds.map(
+            _build_docs_retriever(
+                args.docs_index,
+                top_k=docs_top_k,
+                model_name=docs_model,
+            )
+        )
+    else:
+        # Ensure the fields exist even when retrieval is skipped.
+        kept_ds = kept_ds.map(lambda row: {**row, "docs_context": "", "docs_chunks": []})
 
     qa_engine_config_kwargs: dict[str, Any] = {
         "model_source": model_source,

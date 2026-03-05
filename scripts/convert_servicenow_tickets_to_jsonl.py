@@ -51,6 +51,8 @@ class RejectionConfig:
     rejected_categories: frozenset[str]
     allowed_resources: frozenset[str]
     rejected_resources: frozenset[str]
+    rejected_assignment_groups: frozenset[str]
+    min_opened_date: str  # ISO date string "YYYY-MM-DD", empty = no cutoff
 
 
 def _load_toml_config(config_path: str) -> dict[str, Any]:
@@ -81,6 +83,8 @@ def _config_to_rejection_config(config: dict[str, Any]) -> RejectionConfig:
     auto_generated_cfg = config.get("auto_generated", {})
     categories_cfg = config.get("categories", {})
     resources_cfg = config.get("resources", {})
+    assignment_groups_cfg = config.get("assignment_groups", {})
+    date_cfg = config.get("date", {})
 
     return RejectionConfig(
         allowed_states=_lower_set(state_cfg.get("allowed_states", ["Closed", "Resolved"])),
@@ -95,6 +99,8 @@ def _config_to_rejection_config(config: dict[str, Any]) -> RejectionConfig:
         rejected_categories=_lower_set(categories_cfg.get("rejected", [])),
         allowed_resources=_lower_set(resources_cfg.get("allowed", [])),
         rejected_resources=_lower_set(resources_cfg.get("rejected", [])),
+        rejected_assignment_groups=_lower_set(assignment_groups_cfg.get("rejected", [])),
+        min_opened_date=_norm(date_cfg.get("min_opened_date", "")),
     )
 
 
@@ -102,6 +108,13 @@ def _should_reject(
     incident_fields: Mapping[str, Any],
     rejection_config: RejectionConfig,
 ) -> bool:
+    # Date cutoff — reject tickets opened before min_opened_date.
+    # ISO date strings compare lexicographically, so plain string comparison works.
+    if rejection_config.min_opened_date:
+        opened_at = _norm(incident_fields.get("opened_at"))
+        if not opened_at or opened_at < rejection_config.min_opened_date:
+            return True
+
     state = _norm(incident_fields.get("state"))
     state_lower = state.lower()
     if not state_lower or state_lower not in rejection_config.allowed_states:
@@ -146,6 +159,10 @@ def _should_reject(
     ):
         return True
     if resource_lower and resource_lower in rejection_config.rejected_resources:
+        return True
+
+    assignment_group = _norm(incident_fields.get("assignment_group"))
+    if assignment_group.lower() in rejection_config.rejected_assignment_groups:
         return True
 
     return False
