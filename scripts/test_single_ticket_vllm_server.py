@@ -6,8 +6,6 @@ Edit the constants below, then run:
   python3.11 scripts/test_single_ticket_vllm_server.py
 """
 
-from __future__ import annotations
-
 import gzip
 import json
 import urllib.request

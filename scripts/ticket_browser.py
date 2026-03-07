@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 """
 Lightweight browser for browsing ServiceNow ticket JSONL shards.
 
@@ -14,8 +14,6 @@ Notes:
 - Random access is supported for uncompressed files via byte offsets.
 - Gzip inputs are supported for listing, but "show by index" will re-scan.
 """
-
-from __future__ import annotations
 
 import argparse
 import contextlib

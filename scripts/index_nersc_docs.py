@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 """
 Index NERSC documentation markdown files into a FAISS vector index for retrieval.
 
@@ -15,8 +15,6 @@ Produces:
 Dependencies (install once into your mounted PYTHONUSERBASE):
     pip install --user faiss-cpu sentence-transformers
 """
-
-from __future__ import annotations
 
 import argparse
 import json

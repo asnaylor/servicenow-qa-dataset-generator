@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 """
 Convert ServiceNow tickets stored as "one JSON object per file" into sharded JSONL.
 
@@ -12,8 +12,6 @@ This converter:
 - Writes sharded JSONL (optionally gzip-compressed)
 - Adds a `source_path` field for provenance (relative to the input dir by default)
 """
-
-from __future__ import annotations
 
 import argparse
 import dataclasses

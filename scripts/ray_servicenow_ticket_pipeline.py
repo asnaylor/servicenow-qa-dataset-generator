@@ -9,8 +9,6 @@ Flow:
 4) Write accepted Q&A records to Parquet.
 """
 
-from __future__ import annotations
-
 import argparse
 import glob
 import json
