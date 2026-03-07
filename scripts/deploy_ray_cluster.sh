@@ -15,6 +15,7 @@
 set -euo pipefail  
 
 # Configuration
+export SLURM_GPUS_PER_NODE=4
 export RAY_PORT=6379
 export RAY_DASHBOARD_PORT=8265
 export RAY_TEMP_DIR="${SCRATCH}/tmp/ray/${SLURM_JOB_ID}"
@@ -26,6 +27,11 @@ export RAY_IMAGE="rayproject/ray-llm:2.54.0-extra-py311-cu128"
 export HF_DIR="${HF_HOME:-${SCRATCH}/huggingface/}"
 HF_TOKEN="$(cat ~/.hf_token 2>/dev/null || true)"
 export HF_KEY="${HF_TOKEN:-}"
+
+# Extra Python packages (faiss-cpu, sentence-transformers) installed via pip --user
+# into a persistent scratch directory and mounted via PYTHONUSERBASE.
+PYTHON_LIBS_DIR="${PYTHON_LIBS_DIR:-${SCRATCH}/ray-llm-2.54.0-py311-libs}"
+export PYTHON_LIBS_DIR
 
 #------------------------------------------------------------------------------
 # ServiceNow pipeline paths (edit these)
@@ -47,9 +53,17 @@ MOUNT_TICKETS="/tickets"
 MOUNT_KEPT="/kept"
 MOUNT_REJECTED="/rejected"
 
+# NERSC docs index directory (host path). Must be on a shared filesystem
+# visible from all nodes. Set empty ("") to skip documentation retrieval.
+DOCS_INDEX_DIR="${DOCS_INDEX_DIR:-${SCRATCH}/nersc_docs_index}"
+MOUNT_DOCS_INDEX="/nersc_docs_index"
+# Prefix passed to --docs-index inside the container (must match indexer --output basename).
+DOCS_INDEX_PREFIX="${DOCS_INDEX_PREFIX:-${MOUNT_DOCS_INDEX}/index}"
+
 mkdir -p "${KEPT_DIR}" "${REJECTED_DIR}"
 
 export TICKETS_JSONL_DIR KEPT_DIR REJECTED_DIR MOUNT_TICKETS MOUNT_KEPT MOUNT_REJECTED
+export DOCS_INDEX_DIR MOUNT_DOCS_INDEX DOCS_INDEX_PREFIX
 
 #------------------------------------------------------------------------------
 # LLM pipeline runtime args (override via environment before sbatch)
@@ -69,6 +83,9 @@ podman_llm() {
     if [[ "${PODMAN_WITH_RAY_TMPDIR:-0}" == "1" ]]; then
       extra=(-v "${RAY_TEMP_DIR}:/tmp/ray")
     fi
+    if [[ -n "${DOCS_INDEX_DIR:-}" ]]; then
+      extra+=(-v "${DOCS_INDEX_DIR}:${MOUNT_DOCS_INDEX}")
+    fi
 
     # Run the Ray LLM container
     podman-hpc run \
@@ -84,8 +101,11 @@ podman_llm() {
     -v "${TICKETS_JSONL_DIR}:${MOUNT_TICKETS}" \
     -v "${KEPT_DIR}:${MOUNT_KEPT}" \
     -v "${REJECTED_DIR}:${MOUNT_REJECTED}" \
+    -v "${PYTHON_LIBS_DIR}:/python_libs" \
     "${extra[@]}" \
     -e "HF_TOKEN=${HF_KEY}" \
+    -e "HF_HOME=/home/ray/.cache/huggingface" \
+    -e "PYTHONUSERBASE=/python_libs" \
     -e "RAY_ADDRESS=${RAY_ADDRESS:-}" \
     -w /workdir \
     ${RAY_IMAGE} \
@@ -125,6 +145,7 @@ srun --nodes=1 --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" --gpus-per-ta
             --port="${RAY_PORT}" \
             --dashboard-host=0.0.0.0 \
             --dashboard-port="${RAY_DASHBOARD_PORT}" \
+            --num-gpus=${SLURM_GPUS_PER_NODE} \
             --block " &
 
 HEAD_PID=$!
@@ -170,6 +191,7 @@ if [ -n "$WORKER_NODES" ]; then
                 podman_llm \
                     ray start \
                     --address="${RAY_ADDRESS}" \
+                    --num-gpus=${SLURM_GPUS_PER_NODE} \
                     --block " &
     done
 
@@ -226,6 +248,12 @@ log "Running pipeline..."
 log "TICKETS_JSONL_DIR=${TICKETS_JSONL_DIR} (mounted at ${MOUNT_TICKETS})"
 log "KEPT_DIR=${KEPT_DIR} (mounted at ${MOUNT_KEPT})"
 log "REJECTED_DIR=${REJECTED_DIR} (mounted at ${MOUNT_REJECTED})"
+log "PYTHON_LIBS_DIR=${PYTHON_LIBS_DIR} (mounted at /python_libs)"
+if [[ -n "${DOCS_INDEX_DIR:-}" ]]; then
+  log "DOCS_INDEX_DIR=${DOCS_INDEX_DIR} (mounted at ${MOUNT_DOCS_INDEX}, prefix=${DOCS_INDEX_PREFIX})"
+else
+  log "DOCS_INDEX_DIR= (docs retrieval disabled)"
+fi
 
 # Edit PIPELINE_ARGS to add/remove flags as needed.
 PIPELINE_ARGS=(
@@ -240,6 +268,10 @@ PIPELINE_ARGS=(
 
 if [[ -n "${LIMIT_TICKETS}" ]]; then
   PIPELINE_ARGS+=(--limit-tickets "${LIMIT_TICKETS}")
+fi
+
+if [[ -n "${DOCS_INDEX_DIR:-}" ]]; then
+  PIPELINE_ARGS+=(--docs-index "${DOCS_INDEX_PREFIX}")
 fi
 
 PODMAN_WITH_RAY_TMPDIR=1 podman_llm python3.11 scripts/ray_servicenow_ticket_pipeline.py "${PIPELINE_ARGS[@]}"

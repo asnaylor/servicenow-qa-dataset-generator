@@ -802,7 +802,7 @@ def _load_docs_index(index_prefix: str, model_name: str) -> Any | None:
             if line:
                 chunks.append(json.loads(line))
 
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, device="cpu")
     result = (index, chunks, model)
     _DOCS_INDEX_CACHE[cache_key] = result
     LOG.info(
