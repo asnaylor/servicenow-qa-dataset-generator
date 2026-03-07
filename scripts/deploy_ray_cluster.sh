@@ -15,7 +15,8 @@
 set -euo pipefail  
 
 # Configuration
-export SLURM_GPUS_PER_NODE=4
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+export GPUS_PER_NODE
 export RAY_PORT=6379
 export RAY_DASHBOARD_PORT=8265
 export RAY_TEMP_DIR="${SCRATCH}/tmp/ray/${SLURM_JOB_ID}"
@@ -136,7 +137,7 @@ export RAY_ADDRESS="${HEAD_NODE_IP}:${RAY_PORT}"
 #==============================================================================
 log "Starting Ray head node on ${HEAD_NODE}..."
 
-srun --nodes=1 --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" --gpus-per-task=4 -w "$HEAD_NODE" \
+srun --nodes=1 --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" --gpus-per-task="${GPUS_PER_NODE}" -w "$HEAD_NODE" \
     bash -lc "
         PODMAN_WITH_RAY_TMPDIR=1 podman_llm \
             ray start \
@@ -145,7 +146,7 @@ srun --nodes=1 --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" --gpus-per-ta
             --port="${RAY_PORT}" \
             --dashboard-host=0.0.0.0 \
             --dashboard-port="${RAY_DASHBOARD_PORT}" \
-            --num-gpus=${SLURM_GPUS_PER_NODE} \
+            --num-gpus=${GPUS_PER_NODE} \
             --block " &
 
 HEAD_PID=$!
@@ -186,12 +187,12 @@ if [ -n "$WORKER_NODES" ]; then
 
     for worker in $WORKER_NODES; do
         log "Starting worker on ${worker}..."
-        srun --nodes=1 --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" --gpus-per-task=4 -w "$worker" \
+        srun --nodes=1 --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" --gpus-per-task="${GPUS_PER_NODE}" -w "$worker" \
             bash -lc "
                 podman_llm \
                     ray start \
                     --address="${RAY_ADDRESS}" \
-                    --num-gpus=${SLURM_GPUS_PER_NODE} \
+                    --num-gpus=${GPUS_PER_NODE} \
                     --block " &
     done
 

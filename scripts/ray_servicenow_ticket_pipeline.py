@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 """
 MVP Ray Data LLM pipeline for ServiceNow QA dataset generation.
 
@@ -585,7 +585,7 @@ def _build_quality_postprocess(*, score_threshold: int = 70):
         elif raw.lstrip().startswith("{"):
             reason = "invalid_json_truncated"
             # Best-effort salvage of score when JSON is cut off
-            m = re.search(r"\"score\"\\s*:\\s*(\d+)", raw, flags=re.IGNORECASE)
+            m = re.search(r'"score"\s*:\s*(\d+)', raw, flags=re.IGNORECASE)
             if m:
                 score = int(m.group(1))
                 score = max(0, min(100, score))
@@ -1005,7 +1005,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     LOG.info("Loaded LLM config from: %s", args.llm_config)
     model_source = str(llm_cfg.get("model_source", "meta-llama/Llama-3.1-8B-Instruct"))
     batch_size = int(llm_cfg.get("batch_size", 32))
-    max_model_len = int(llm_cfg.get("max_model_len", 8192))
     context_max_chars = int(llm_cfg.get("context_max_chars", 12000))
 
     quality_cfg = llm_cfg.get("quality", {})
